@@ -1,0 +1,84 @@
+# 放到仓库的 .github/workflows/build-cores.yml
+# mihomo.go 和 singbox.go 放在仓库根目录。
+# 在 Actions 页面手动运行，可勾选只构建其中一个。
+# 完成后 Releases 里：
+#   core-N     -> libmihomo.so.gz  + sha256.txt
+#   singbox-N  -> libsingbox.so.gz + sha256.txt
+name: build-cores
+on:
+  workflow_dispatch:
+    inputs:
+      build_mihomo:
+        description: 构建 mihomo
+        type: boolean
+        default: true
+      build_singbox:
+        description: 构建 sing-box
+        type: boolean
+        default: true
+permissions:
+  contents: write
+jobs:
+  mihomo:
+    if: ${{ inputs.build_mihomo }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone mihomo
+        run: git clone --depth 1 --branch Alpha https://github.com/MetaCubeX/mihomo.git mihomo
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Build libmihomo.so (android/arm64)
+        run: |
+          go version
+          mkdir -p mihomo/libcore
+          cp mihomo.go mihomo/libcore/main.go
+          cd mihomo
+          export CC="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          CGO_ENABLED=1 GOOS=android GOARCH=arm64 go build \
+            -buildmode=c-shared -trimpath -tags with_gvisor \
+            -ldflags "-s -w -checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384" \
+            -o ../libmihomo.so ./libcore
+          cd ..
+          sha256sum libmihomo.so | cut -d' ' -f1 | tee sha256.txt
+          gzip -9 -k libmihomo.so
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "core-${{ github.run_number }}" libmihomo.so.gz sha256.txt --notes "mihomo core for android/arm64"
+
+  singbox:
+    if: ${{ inputs.build_singbox }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone sing-box (latest stable 1.12.x)
+        run: |
+          TAG=$(git ls-remote --tags --refs https://github.com/SagerNet/sing-box.git 'v1.12.*' | sed 's#.*/##' | grep -v -- '-' | sort -V | tail -1)
+          echo "using $TAG"
+          git clone --depth 1 --branch "$TAG" https://github.com/SagerNet/sing-box.git sing-box
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Build libsingbox.so (android/arm64)
+        run: |
+          go version
+          mkdir -p sing-box/libcore
+          cp singbox.go sing-box/libcore/main.go
+          cd sing-box
+          export CC="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          CGO_ENABLED=1 GOOS=android GOARCH=arm64 go build \
+            -buildmode=c-shared -trimpath \
+            -tags "with_quic,with_utls,with_clash_api" \
+            -ldflags "-s -w -checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384" \
+            -o ../libsingbox.so ./libcore
+          cd ..
+          sha256sum libsingbox.so | cut -d' ' -f1 | tee sha256.txt
+          gzip -9 -k libsingbox.so
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "singbox-${{ github.run_number }}" libsingbox.so.gz sha256.txt --notes "sing-box core for android/arm64"
