@@ -1,1 +1,2 @@
 # bettsocks
+用于nagramxf插件代理，mihomo/singbox双内核拉取机场节点配置使用socks5提供tg内置代理功能
