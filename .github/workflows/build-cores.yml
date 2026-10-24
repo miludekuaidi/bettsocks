@@ -1,0 +1,92 @@
+# 放到仓库的 .github/workflows/build-cores.yml
+# 仓库里新建 Doublecore 目录，把 mihomo.go 和 singbox.go 放进去。
+# 在 Actions 页面手动运行（两个内核并行构建），完成后只有一个 Release：
+#   doublecore-N -> libmihomo.so.gz, libsingbox.so.gz,
+#                   sha256-mihomo.txt, sha256-singbox.txt
+# 其中一个构建失败时，另一个仍会发布。
+name: build-cores
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  mihomo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone mihomo
+        run: git clone --depth 1 --branch Alpha https://github.com/MetaCubeX/mihomo.git mihomo
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Build libmihomo.so (android/arm64)
+        run: |
+          go version
+          mkdir -p Doublecore/out mihomo/libcore
+          cp Doublecore/mihomo.go mihomo/libcore/main.go
+          cd mihomo
+          export CC="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          CGO_ENABLED=1 GOOS=android GOARCH=arm64 go build \
+            -buildmode=c-shared -trimpath -tags with_gvisor \
+            -ldflags "-s -w -checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384" \
+            -o ../Doublecore/out/libmihomo.so ./libcore
+          cd ../Doublecore/out
+          sha256sum libmihomo.so | cut -d' ' -f1 | tee sha256-mihomo.txt
+          gzip -9 libmihomo.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-mihomo
+          path: Doublecore/out/
+
+  singbox:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone sing-box (latest stable 1.12.x)
+        run: |
+          TAG=$(git ls-remote --tags --refs https://github.com/SagerNet/sing-box.git 'v1.12.*' | sed 's#.*/##' | grep -v -- '-' | sort -V | tail -1)
+          echo "using $TAG"
+          git clone --depth 1 --branch "$TAG" https://github.com/SagerNet/sing-box.git sing-box
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Build libsingbox.so (android/arm64)
+        run: |
+          go version
+          mkdir -p Doublecore/out sing-box/libcore
+          cp Doublecore/singbox.go sing-box/libcore/main.go
+          cd sing-box
+          export CC="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          CGO_ENABLED=1 GOOS=android GOARCH=arm64 go build \
+            -buildmode=c-shared -trimpath \
+            -tags "with_quic,with_utls,with_clash_api" \
+            -ldflags "-s -w -checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384" \
+            -o ../Doublecore/out/libsingbox.so ./libcore
+          cd ../Doublecore/out
+          sha256sum libsingbox.so | cut -d' ' -f1 | tee sha256-singbox.txt
+          gzip -9 libsingbox.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-singbox
+          path: Doublecore/out/
+
+  release:
+    needs: [mihomo, singbox]
+    if: ${{ !cancelled() && (needs.mihomo.result == 'success' || needs.singbox.result == 'success') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: core-*
+          merge-multiple: true
+          path: out
+      - name: Release (one release, both cores)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd out
+          ls -l
+          { for f in sha256-*.txt; do echo "$f: $(cat "$f")"; done; } > ../notes.txt
+          gh release create "doublecore-${{ github.run_number }}" ./* --title "Doublecore ${{ github.run_number }}" --notes-file ../notes.txt
