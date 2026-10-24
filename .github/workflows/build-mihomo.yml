@@ -18,7 +18,7 @@ jobs:
       - name: Build libmihomo.so (android/arm64)
         run: |
           mkdir -p mihomo/libcore
-          cp main.go mihomo/libcore/main.go
+          cp mihomo_main.go mihomo/libcore/mihomo_main.go
           go version
           cd mihomo
           export CC="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
