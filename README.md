@@ -53,7 +53,7 @@
 
 把 `proxy_core.plugin` 装进客户端的插件管理。
 
-> 插件默认从 `miludekuaidi/flag` 获取核心。如果你用的是自己的仓库，
+> 插件默认从 `miludekuaidi/bettsocks` 获取核心。如果你用的是自己的仓库，
 > 修改 `proxy_core.plugin` 顶部的 `CORE_REPO = "用户名/仓库名"` 即可。
 
 ### 3. 使用
