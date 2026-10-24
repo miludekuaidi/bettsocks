@@ -1,0 +1,40 @@
+# 放到你仓库的 .github/workflows/build-singbox.yml，
+# singbox_main.go 放在仓库根目录。在 Actions 页面手动运行。
+# 完成后 Releases 里会有 libsingbox.so.gz 和 sha256.txt。
+name: build-singbox-core
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone sing-box (latest stable 1.12.x)
+        run: |
+          TAG=$(git ls-remote --tags --refs https://github.com/SagerNet/sing-box.git 'v1.12.*' | sed 's#.*/##' | grep -v -- '-' | sort -V | tail -1)
+          echo "using $TAG"
+          git clone --depth 1 --branch "$TAG" https://github.com/SagerNet/sing-box.git sing-box
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Build libsingbox.so (android/arm64)
+        run: |
+          go version
+          mkdir -p sing-box/libcore
+          cp singbox_main.go sing-box/libcore/main.go
+          cd sing-box
+          export CC="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          CGO_ENABLED=1 GOOS=android GOARCH=arm64 go build \
+            -buildmode=c-shared -trimpath \
+            -tags "with_quic,with_utls,with_clash_api" \
+            -ldflags "-s -w -checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384" \
+            -o ../libsingbox.so ./libcore
+          cd ..
+          sha256sum libsingbox.so | cut -d' ' -f1 | tee sha256.txt
+          gzip -9 -k libsingbox.so
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "singbox-${{ github.run_number }}" libsingbox.so.gz sha256.txt --notes "sing-box core for android/arm64"
