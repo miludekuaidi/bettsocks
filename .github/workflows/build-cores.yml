@@ -89,4 +89,5 @@ jobs:
           cd out
           ls -l
           { for f in sha256-*.txt; do echo "$f: $(cat "$f")"; done; } > ../notes.txt
-          gh release create "doublecore-${{ github.run_number }}" ./* --title "Doublecore ${{ github.run_number }}" --notes-file ../notes.txt
+          RELEASE_TIME=$(date -u '+%Y%m%d-%H%M%S')
+          gh release create "double-core-${RELEASE_TIME}" ./* --title "Double Core ${RELEASE_TIME}" --notes-file ../notes.txt
