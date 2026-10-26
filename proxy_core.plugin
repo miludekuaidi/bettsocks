@@ -796,7 +796,7 @@ def _show_card_dialog(title, message=None, body=None, buttons=(), scroll=True, h
     run_on_ui_thread(show)
 
 
-def list_dialog(title, labels, on_pick):
+def list_dialog(title, labels, on_pick, buttons=None):
     def body(k, dlg):
         box = k._vbox()
         for i, label in enumerate(labels):
@@ -809,7 +809,7 @@ def list_dialog(title, labels, on_pick):
                 (lambda idx: (lambda: (dlg.dismiss(), on_pick(idx))))(i)))
             box.addView(tv)
         return box
-    _show_card_dialog(title, body=body, buttons=[("取消", "outline", lambda: None)])
+    _show_card_dialog(title, body=body, buttons=buttons or [("取消", "outline", lambda: None)])
 
 
 def message_dialog(title, message, pos_text=None, on_pos=None):
@@ -1331,6 +1331,7 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         self._started = False
         self._running_kind = None
         self._port = 0
+        self._stopping = False
         self._api = None
         self._meta = {}
         self._menu_ids = []
@@ -1581,21 +1582,20 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
     def _manage(self):
         def build():
             srcs = self._load_sources()
-            labels = ["＋ 添加订阅", "＋ 导入单个节点（粘贴链接）"]
+            labels = ["＋ 添加订阅"]
             labels += ["%s  ·  %s" % (s["name"] or "未命名", _short(s["value"])) for s in srcs]
-            if srcs:
-                labels.append("🗑 清空全部")
 
             def pick(i):
                 if i == 0:
                     self._edit_source(None)
-                elif i == 1:
-                    self._import_nodes()
-                elif i <= len(srcs) + 1:
-                    self._source_menu(i - 2)
                 else:
-                    self._save_and_apply([], "已清空所有订阅", quiet=True)
-            list_dialog("订阅管理 (%d)" % len(srcs), labels, pick)
+                    self._source_menu(i - 1)
+
+            buttons = [("更新订阅", "primary", lambda: self._busy_run("正在更新订阅…", self._refresh))]
+            if srcs:
+                buttons.append(("清空全部", "outline", lambda: self._save_and_apply([], "已清空所有订阅", quiet=True)))
+            buttons.append(("关闭", "outline", lambda: None))
+            list_dialog("订阅管理 (%d)" % len(srcs), labels, pick, buttons=buttons)
         threading.Thread(target=build, daemon=True).start()
 
     def _source_menu(self, idx):
@@ -1756,8 +1756,12 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         keys = list(CORES)
         labels = [CORES[k]["label"] + ("  ✔" if k == cur else "") +
                   ("" if os.path.exists(_core_path(k)) else "（未安装）") for k in keys]
+        labels.append("更新当前内核")
 
         def pick(i):
+            if i == len(keys):
+                self._busy_run("正在更新核心…", lambda: self._install_or_update(cur))
+                return
             new = keys[i]
             if new == cur:
                 return
@@ -1766,6 +1770,8 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
                 try:
                     self._stop(restore_tg=True)  # 先停掉旧内核，避免两个内核同时占用
                     self.set_setting("core_type", new)
+                    # 设置保存后立即刷新控制面板，使“内核”按钮显示新内核。
+                    self._ui_refresh()
                     if _LIB is not None and _LIB_KIND != new:
                         self._ask_restart("已切换到 %s。同一进程里只能加载一种内核，"
                                           "请重启客户端后再点“启动内核”。" % CORES[new]["label"])
@@ -1809,12 +1815,28 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         self.set_setting("enabled", False)
         _info("内核已停止，Telegram 代理设置已恢复" if was else "内核当前没有运行")
 
-    def _stop_locked(self):
-        if _LIB_FUNCS is not None and self._started:
-            try:
-                _LIB_FUNCS[1]()
-            except Exception as e:
-                self.log("ProxyCore stop: %s" % e)
+    def _stop_locked(self, async_stop=True):
+        if _LIB_FUNCS is not None and self._started and not self._stopping:
+            stop_fn = _LIB_FUNCS[1]
+            if async_stop:
+                # 用户主动断开时不等待原生 Stop，避免面板长时间卡在“正在断开”。
+                self._stopping = True
+
+                def stop_worker():
+                    try:
+                        stop_fn()
+                    except Exception as e:
+                        self.log("ProxyCore stop: %s" % e)
+                    finally:
+                        self._stopping = False
+
+                threading.Thread(target=stop_worker, name="proxy-core-stop", daemon=True).start()
+            else:
+                # 启动前清理旧实例必须保持顺序，避免新旧内核并行。
+                try:
+                    stop_fn()
+                except Exception as e:
+                    self.log("ProxyCore stop: %s" % e)
         self._started = False
         self._api = None
 
@@ -1851,12 +1873,14 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
 
     def _start(self, force=False):
         with self._lock:
+            if self._stopping:
+                raise RuntimeError("内核仍在断开，请稍后再连接")
             kind = self._kind()
             sources = self._load_sources()
             if not sources:
                 raise RuntimeError("还没有添加订阅或节点，请先在“订阅管理”里添加")
             funcs = _load_lib(kind)  # 未安装 / 需重启会在这里抛出
-            self._stop_locked()  # 先停掉自己正在运行的实例，再选端口
+            self._stop_locked(async_stop=False)  # 启动前同步清理旧实例，再选端口
             want = int(str(self.get_setting("port", "17891")).strip())
             port, ctl_port = pick_ports(want)
             home = _home()
@@ -2169,7 +2193,7 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         if d == -2:
             return "检测中…", "sub"
         if d <= 0:
-            return "超时", "bad"
+            return "timeout", "bad"
         return "%d ms" % d, ("ok" if d < 300 else "warn")
 
     def _apply_delay(self, name):
@@ -2235,11 +2259,7 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
                 r.addView(self._button(text, "outline", fn, h=44, weight=1, m=(4, 4, 4, 4), sp=14))
             ct.addView(r)
         tools([("内核：" + snap["label"], lambda: self._choose_core()),
-               ("更新核心", lambda: self._busy_run(
-                   "正在更新核心…", lambda: self._install_or_update(self._kind())))])
-        tools([("订阅管理", lambda: self._manage()),
-               ("导入节点", lambda: self._import_nodes())])
-        tools([("更新全部订阅", lambda: self._busy_run("正在更新订阅…", self._refresh)),
+               ("订阅管理", lambda: self._manage()),
                ("分组管理", lambda: self._group_manage())])
 
         cols = snap["cols"]
@@ -2365,9 +2385,27 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         except Exception:
             pass
 
+    def _delete_node_source(self, name):
+        idx = self._node_src.get(name)
+        sources = self._load_sources()
+        if idx is None or idx >= len(sources) or _is_sub_url(sources[idx]["value"]):
+            _err("无法定位这个单节点来源")
+            return
+        src = sources[idx]
+        if len(re.split(r"\s+", src["value"].strip())) != 1:
+            _err("该来源包含多个节点，请在订阅管理中编辑")
+            return
+        message_dialog("删除节点", "确定删除「%s」？" % name, "删除", lambda: self._save_and_apply(
+            sources[:idx] + sources[idx + 1:], "已删除节点：" + name, quiet=True))
+
     def _node_card(self, n, snap, compact):
         name, info = n["name"], n["info"]
         sel = snap["running"] and snap.get("active") == name
+        src_idx = self._node_src.get(name)
+        sources = self._load_sources()
+        deletable = (src_idx is not None and src_idx < len(sources)
+                     and not _is_sub_url(sources[src_idx]["value"])
+                     and len(re.split(r"\s+", sources[src_idx]["value"].strip())) == 1)
         c = self._card(selected=sel, compact=compact, pad=16,
                        on_click=lambda: self._run_bg(lambda: self._select_node(name)))
         title = name
@@ -2376,6 +2414,8 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         dtv = self._text(text, 13, color)
         self._delay_views[name] = dtv
         test = lambda: self._run_bg(lambda: self._test_delay(name))
+        dtv.setClickable(True)
+        dtv.setOnClickListener(_VClick(test))
         if compact:
             trow = self._hbox()
             tt = self._text(title, 15, "text", True, lines=2)
@@ -2383,13 +2423,17 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
             trow.addView(tt)
             if sel:
                 trow.addView(self._badge("使用中"))
+            if deletable:
+                trow.addView(self._small_button("删除", lambda: self._delete_node_source(name)))
             c.addView(trow)
-            c.addView(self._text(line2, 12, "accent", lines=1))
             bot = self._hbox()
-            bot.setLayoutParams(self._lp(-1, -2, m=(0, 8, 0, 0)))
-            dtv.setLayoutParams(self._lp(0, -2, weight=1))
+            bot.setLayoutParams(self._lp(-1, -2, m=(0, 12, 0, 0)))
+            proto = self._text(line2, 12, "accent", lines=1)
+            proto.setLayoutParams(self._lp(0, -2, weight=1, m=(0, 0, 12, 0)))
+            bot.addView(proto)
+            dtv.setGravity(5)
+            dtv.setPadding(self._dp(8), 0, 0, 0)
             bot.addView(dtv)
-            bot.addView(self._small_button("检测延迟", test))
             c.addView(bot)
         else:
             r = self._hbox()
@@ -2403,11 +2447,19 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
             trow.addView(tt)
             if sel:
                 trow.addView(self._badge("使用中"))
+            if deletable:
+                trow.addView(self._small_button("删除", lambda: self._delete_node_source(name)))
             col.addView(trow)
-            col.addView(self._text(line2, 13, "accent", lines=1))
-            col.addView(dtv)
+            info_row = self._hbox()
+            info_row.setLayoutParams(self._lp(-1, -2, m=(0, 8, 0, 0)))
+            proto = self._text(line2, 13, "accent", lines=1)
+            proto.setLayoutParams(self._lp(0, -2, weight=1, m=(0, 0, 12, 0)))
+            info_row.addView(proto)
+            dtv.setGravity(5)
+            dtv.setPadding(self._dp(8), 0, 0, 0)
+            info_row.addView(dtv)
+            col.addView(info_row)
             r.addView(col)
-            r.addView(self._small_button("检测延迟", test))  # 按钮放在卡片末尾
             c.addView(r)
         return c
 
