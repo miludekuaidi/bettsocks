@@ -197,12 +197,17 @@ def _port_free(p):
         s.close()
 
 
-def pick_ports(preferred):
-    """找一对相邻的空闲端口（代理端口 + 控制端口），避免和其它代理软件冲突。"""
-    for p in range(preferred, preferred + 60, 2):
-        if _port_free(p) and _port_free(p + 1):
-            return p, p + 1
-    raise RuntimeError("找不到可用端口，请换一个本地端口")
+def pick_ports(backup):
+    """优先使用内置 9090，设置端口只作为备用，不做端口顺延。"""
+    backup = int(backup)
+    candidates = [(9090, 9091)]
+    if backup != 9090:
+        candidates.append((backup, backup + 1))
+    for proxy_port, ctl_port in candidates:
+        if (1024 <= proxy_port <= 65534 and _port_free(proxy_port)
+                and _port_free(ctl_port)):
+            return proxy_port, ctl_port
+    raise RuntimeError("内置端口 9090 和备用端口都被占用，请更换备用端口")
 
 
 # ---------- mihomo 配置 ----------
@@ -969,7 +974,7 @@ def read_tg_proxy():
 
 
 # ---------- 节点信息（协议 · 传输 · 加密），用于控制面板展示 ----------
-_PROTO_NAMES = {"shadowsocks": "SS", "ss": "SS"}
+_PROTO_NAMES = {"shadowsocks": "SS", "ss": "SS", "hysteria2": "hy2", "hy2": "hy2"}
 
 
 def _ob_info(ob):
@@ -1523,13 +1528,13 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
                 sw.setChecked(bool(auto))
                 sw.setOnCheckedChangeListener(_Check(self._on_auto))
                 return [
-                    Custom(view=self._setting_row(k, "本地端口", "被占用时自动顺延，点击右侧修改", pill)),
+                    Custom(view=self._setting_row(k, "本地端口", "优先使用 9090，被占用时使用备用端口", pill)),
                     Custom(view=self._setting_row(k, "自动连接", "随客户端启动时自动连接（记住上次状态）", sw)),
                 ]
             except Exception as e:
                 self.log("settings rows: %s" % e)
         return [
-            self._mk(Input, key="port", text="本地端口", subtext="被占用时自动顺延",
+            self._mk(Input, key="port", text="本地端口", subtext="优先使用 9090，被占用时使用备用端口",
                      icon="msg_language", default=port,
                      on_change=lambda v: self.set_setting("port", v)),
             self._mk(Switch, key="enabled", text="自动连接",
@@ -1881,8 +1886,8 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
                 raise RuntimeError("还没有添加订阅或节点，请先在“订阅管理”里添加")
             funcs = _load_lib(kind)  # 未安装 / 需重启会在这里抛出
             self._stop_locked(async_stop=False)  # 启动前同步清理旧实例，再选端口
-            want = int(str(self.get_setting("port", "17891")).strip())
-            port, ctl_port = pick_ports(want)
+            backup = int(str(self.get_setting("port", "17891")).strip())
+            port, ctl_port = pick_ports(backup)
             home = _home()
             secret = os.urandom(8).hex()
             groups = self._groups_for_config(set(self._scan_node_infos()))
@@ -1919,8 +1924,8 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
             set_tg_proxy(True, "127.0.0.1", port)
             self._delay = {}
             self._restore_pick()
-            if port != want:
-                _info("端口 %d 被占用，已改用 %d" % (want, port))
+            if port != 9090:
+                _info("内置端口 9090 被占用，已使用备用端口 %d" % port)
         self._ui_refresh()
 
     def _ensure_running(self):
@@ -2426,15 +2431,16 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
             if deletable:
                 trow.addView(self._small_button("删除", lambda: self._delete_node_source(name)))
             c.addView(trow)
-            bot = self._hbox()
-            bot.setLayoutParams(self._lp(-1, -2, m=(0, 12, 0, 0)))
-            proto = self._text(line2, 12, "accent", lines=1)
-            proto.setLayoutParams(self._lp(0, -2, weight=1, m=(0, 0, 12, 0)))
-            bot.addView(proto)
+            # 双列卡片较窄：协议和延迟分行，避免协议文本或延迟被截断。
+            proto = self._text(line2, 12, "accent", lines=2)
+            proto.setLayoutParams(self._lp(-1, -2, m=(0, 12, 0, 0)))
+            c.addView(proto)
+            delay_row = self._hbox()
+            delay_row.setLayoutParams(self._lp(-1, -2, m=(0, 2, 0, 0)))
             dtv.setGravity(5)
-            dtv.setPadding(self._dp(8), 0, 0, 0)
-            bot.addView(dtv)
-            c.addView(bot)
+            dtv.setPadding(0, 0, 0, 0)
+            delay_row.addView(dtv, self._lp(-1, -2, weight=1))
+            c.addView(delay_row)
         else:
             r = self._hbox()
             r.addView(self._icon(44, 16))
