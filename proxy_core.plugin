@@ -2,7 +2,7 @@ __id__ = "proxy_core"
 __name__ = "Proxy Core"
 __description__ = "内置 mihomo / sing-box 双内核：控制面板一键安装、连接、选节点"
 __author__ = "@zizhouwangguo"
-__version__ = "3.3.0"
+__version__ = "3.4.0"
 __app_version__ = ">=12.0.0"
 
 import base64
@@ -139,7 +139,10 @@ def _short(value):
         u = urllib.parse.urlparse(value)
         s = u.netloc + u.path
         return s if len(s) <= 30 else s[:29] + "…"
-    return "%d 条节点链接" % len([x for x in re.split(r"\s+", value) if x])
+    toks = [x for x in re.split(r"\s+", value) if x]
+    if len(toks) == 1:
+        return "%s 节点" % toks[0].split("://", 1)[0].upper()
+    return "%d 条节点链接" % len(toks)
 
 
 def _default_name(value, index):
@@ -151,6 +154,36 @@ def _default_name(value, index):
 
 def _q(x):
     return urllib.parse.quote(str(x), safe="")
+
+
+_NODE_SCHEMES = ("vmess", "vless", "trojan", "ss", "ssr", "hysteria", "hysteria2", "hy2",
+                 "tuic", "wireguard", "socks5", "anytls")
+
+
+def _is_node_link(x):
+    m = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*)://\S+$", str(x).strip())
+    return bool(m) and m.group(1).lower() in _NODE_SCHEMES
+
+
+def _node_link_name(link):
+    try:
+        return uri_to_outbound(link)["tag"]
+    except Exception:
+        pass
+    frag = urllib.parse.unquote(urllib.parse.urlparse(link).fragment)
+    return frag or link.split("://", 1)[0].upper()
+
+
+def _clipboard_text():
+    try:
+        ctx = ApplicationLoader.applicationContext
+        cm = cast(jclass("android.content.ClipboardManager"), ctx.getSystemService("clipboard"))
+        clip = cm.getPrimaryClip()
+        if clip is None or clip.getItemCount() == 0:
+            return ""
+        return str(clip.getItemAt(0).coerceToText(ctx) or "")
+    except Exception:
+        return ""
 
 
 def _port_free(p):
@@ -178,7 +211,7 @@ def _re_quote(s):
 
 
 
-def build_mihomo_config(sources, port, ctl_port, secret, home, groups=None):
+def build_mihomo_config(sources, port, ctl_port, secret, home, groups=None, scopes=None):
     hc = {"enable": True, "url": HC_URL, "interval": 300}
     providers, meta = {}, {}
     for i, s in enumerate(sources):
@@ -200,6 +233,14 @@ def build_mihomo_config(sources, port, ctl_port, secret, home, groups=None):
             providers[pid] = {"type": "file", "path": p, "health-check": hc}
             meta[pid] = {"name": s["name"], "kind": "links"}
     use = list(providers)
+    snames, sgroups = [], []
+    for key, pids in (scopes or {}).items():  # “只用某个订阅 / 单节点”的自动选择组
+        pids = [x for x in pids if x in providers]
+        if not pids:
+            continue
+        snames.append("S:" + key)
+        sgroups.append({"name": "S:" + key, "type": "url-test", "use": pids, "url": HC_URL,
+                        "interval": 300, "tolerance": 50})
     gnames, ggroups = [], []
     for g in groups or []:
         if not g["nodes"]:
@@ -226,10 +267,10 @@ def build_mihomo_config(sources, port, ctl_port, secret, home, groups=None):
                 "nameserver": ["223.5.5.5", "8.8.8.8"]},
         "proxy-providers": providers,
         "proxy-groups": [
-            {"name": "PROXY", "type": "select", "proxies": ["AUTO"] + gnames, "use": use},
+            {"name": "PROXY", "type": "select", "proxies": ["AUTO"] + gnames + snames, "use": use},
             {"name": "AUTO", "type": "url-test", "use": use, "url": HC_URL,
              "interval": 300, "tolerance": 50},
-        ] + ggroups,
+        ] + ggroups + sgroups,
         "rules": ["MATCH,PROXY"],
     }
     return cfg, meta
@@ -442,7 +483,7 @@ def _unique(tag, used):
 
 
 def build_singbox_config(sources, port, ctl_port, secret, home, force, groups=None):
-    nodes, used, meta = [], {"PROXY", "AUTO", "direct"}, {}
+    nodes, used, meta, pid_tags = [], {"PROXY", "AUTO", "direct"}, {}, {}
     for i, s in enumerate(sources):
         pid = "s%d" % i
         value = str(s["value"]).strip()
@@ -477,6 +518,7 @@ def build_singbox_config(sources, port, ctl_port, secret, home, force, groups=No
                 continue
             ob["tag"] = _unique(ob["tag"], used)
             nodes.append(ob)
+            pid_tags.setdefault(pid, []).append(ob["tag"])
             count += 1
         meta[pid] = {"name": s["name"], "kind": "sub" if is_sub else "links",
                      "count": count, "error": err}
@@ -494,14 +536,28 @@ def build_singbox_config(sources, port, ctl_port, secret, home, force, groups=No
         gout.append({"type": "urltest", "tag": gt, "outbounds": members, "url": HC_URL,
                      "interval": "5m", "tolerance": 50})
         gnames.append(gt)
+    scope_members = {}
+    for pid, m in meta.items():
+        if pid_tags.get(pid):
+            key = pid if m["kind"] == "sub" else "nodes"
+            scope_members.setdefault(key, []).extend(pid_tags[pid])
+    sgout, snames = [], []
+    for key, members in scope_members.items():
+        st = "S:" + key
+        if st in used:
+            continue
+        used.add(st)
+        sgout.append({"type": "urltest", "tag": st, "outbounds": members, "url": HC_URL,
+                      "interval": "5m", "tolerance": 50})
+        snames.append(st)
     cfg = {
         "log": {"level": "warn"},
         "dns": {"servers": [{"type": "udp", "tag": "dns-bootstrap", "server": "223.5.5.5"}],
                 "final": "dns-bootstrap"},
         "inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1",
                       "listen_port": int(port)}],
-        "outbounds": nodes + gout + [
-            {"type": "selector", "tag": "PROXY", "outbounds": ["AUTO"] + gnames + tags,
+        "outbounds": nodes + gout + sgout + [
+            {"type": "selector", "tag": "PROXY", "outbounds": ["AUTO"] + gnames + snames + tags,
              "default": "AUTO"},
             {"type": "urltest", "tag": "AUTO", "outbounds": tags, "url": HC_URL,
              "interval": "5m", "tolerance": 50},
@@ -515,9 +571,9 @@ def build_singbox_config(sources, port, ctl_port, secret, home, force, groups=No
 
 
 # ---------- 核心自动获取与安装 ----------
-def _http_get(url, timeout=60, proxy_port=0):
+def _http_get(url, timeout=60, proxy_port=0, ua="Mozilla/5.0"):
     """先直连；失败且本地代理在运行时，改走本地代理（HTTP）。"""
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*"})
+    req = urllib.request.Request(url, headers={"User-Agent": ua, "Accept": "*/*"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read()
@@ -672,7 +728,7 @@ def _kit():
     return _Kit(act, density, _PAL_DARK if dark else _PAL_LIGHT)
 
 
-def _show_card_dialog(title, message=None, body=None, buttons=(), scroll=True):
+def _show_card_dialog(title, message=None, body=None, buttons=(), scroll=True, header=None):
     """body: 函数(kit, dlg) -> View；buttons: [(文字, 样式, 回调, 字号)]，回调返回 False 时对话框保持打开。"""
     def show():
         try:
@@ -700,6 +756,10 @@ def _show_card_dialog(title, message=None, body=None, buttons=(), scroll=True):
 
             if message:
                 card.addView(capped(k._text(message, 14, "sub"), int(sh * 0.45)))
+            if header is not None:  # 固定在列表上方、不随列表滚动的区域（例如搜索框）
+                hv = header(k, dlg)
+                hv.setLayoutParams(k._lp(-1, -2, m=(0, 10, 0, 2)))
+                card.addView(hv)
             if body is not None:
                 view = body(k, dlg)
                 if scroll:
@@ -759,14 +819,53 @@ def message_dialog(title, message, pos_text=None, on_pos=None):
     _show_card_dialog(title, message=message, buttons=buttons)
 
 
-def multi_dialog(title, labels, checked, on_ok):
-    """勾选对话框；“全选/清空”在原地切换，不会关闭对话框。"""
-    state, rows, holder = list(checked), [], {}
+def multi_dialog(title, labels, checked, on_ok, searchable=False):
+    """勾选对话框。searchable=True 时顶部有关键词筛选框（空格分隔多个关键词，需同时包含）；
+    “全选/清空”只作用于当前显示的行，不会关闭对话框。"""
+    state, rows, holder = list(checked), [], {"kw": ""}
+
+    def visible(i):
+        # 空格 = 同时包含；竖线 | = 或者。例如“香港 iplc|日本”
+        low = labels[i].lower()
+        alts = [a.split() for a in holder["kw"].lower().split("|")]
+        alts = [a for a in alts if a]
+        return not alts or any(all(w in low for w in a) for a in alts)
+
+    def status():
+        tv = holder.get("status")
+        if tv is not None:
+            vis = sum(1 for i in range(len(labels)) if visible(i))
+            tv.setText("已选 %d / 共 %d · 当前显示 %d" % (sum(1 for x in state if x), len(labels), vis))
 
     def paint(i):
         k, tv = holder["k"], rows[i]
         tv.setText(("☑  " if state[i] else "☐  ") + labels[i])
         tv.setBackground(k._shape("icon", 14) if state[i] else k._shape("card", 14, "stroke"))
+
+    def on_text(t):
+        holder["kw"] = t.strip()
+        for i, tv in enumerate(rows):
+            tv.setVisibility(0 if visible(i) else 8)
+        status()
+
+    def header(k, dlg):
+        box = k._vbox()
+        e = jclass("android.widget.EditText")(k._act)
+        e.setHint("输入关键词筛选：空格=同时包含，|=或者")
+        e.setTextSize(15.0)
+        e.setTextColor(k._c("text"))
+        e.setHintTextColor(k._c("sub"))
+        e.setBackground(k._shape("card", 14, "stroke"))
+        e.setPadding(k._dp(14), k._dp(10), k._dp(14), k._dp(10))
+        e.setSingleLine(True)
+        e.addTextChangedListener(_Watch(on_text))
+        box.addView(e)
+        st = k._text("", 12, "sub")
+        st.setPadding(k._dp(4), k._dp(6), k._dp(4), 0)
+        holder["status"] = st
+        box.addView(st)
+        box.addView(k._text("“全选/清空”只作用于当前显示的节点", 11, "sub"))
+        return box
 
     def body(k, dlg):
         holder["k"] = k
@@ -781,18 +880,24 @@ def multi_dialog(title, labels, checked, on_ok):
             def toggle(idx=i):
                 state[idx] = not state[idx]
                 paint(idx)
+                status()
             tv.setOnClickListener(_VClick(toggle))
             box.addView(tv)
             paint(i)
+        status()
         return box
 
     def toggle_all():
-        val = not all(state)
-        for i in range(len(state)):
+        vis = [i for i in range(len(state)) if visible(i)]
+        if not vis:
+            return False
+        val = not all(state[i] for i in vis)
+        for i in vis:
             state[i] = val
             paint(i)
+        status()
         return False
-    _show_card_dialog(title, body=body, buttons=[
+    _show_card_dialog(title, body=body, header=header if searchable else None, buttons=[
         ("取消", "outline", lambda: None, 14),
         ("全选/清空", "outline", toggle_all, 14),
         ("保存", "primary", lambda: on_ok(list(state)), 14)])
@@ -1049,6 +1154,27 @@ class _Check(dynamic_proxy(_CheckIface)):
             pass
 
 
+_WatchIface = jclass("android.text.TextWatcher")
+
+
+class _Watch(dynamic_proxy(_WatchIface)):
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def beforeTextChanged(self, s, start, count, after):
+        pass
+
+    def onTextChanged(self, s, start, before, count):
+        pass
+
+    def afterTextChanged(self, s):
+        try:
+            self._fn(str(s.toString()))
+        except Exception:
+            pass
+
+
 # ---------- 视图工具（控制面板和对话框共用） ----------
 class _UiMixin:
     """依赖 self._act / self._density / self._pal。"""
@@ -1160,6 +1286,24 @@ class _UiMixin:
         b.setLayoutParams(self._lp(-1 if weight is None else 0, self._dp(h), weight=weight, m=m))
         return b
 
+    def _chip(self, text, selected, fn):
+        tv = jclass("android.widget.TextView")(self._act)
+        tv.setText(str(text))
+        tv.setTextSize(14.0)
+        tv.setGravity(17)
+        tv.setTypeface(jclass("android.graphics.Typeface").DEFAULT_BOLD)
+        tv.setPadding(self._dp(16), 0, self._dp(16), 0)
+        if selected:
+            tv.setBackground(self._shape("blue", 18))
+            tv.setTextColor(jclass("android.graphics.Color").WHITE)
+        else:
+            tv.setBackground(self._shape("card", 18, "outline", sw=1))
+            tv.setTextColor(self._c("accent"))
+        tv.setClickable(True)
+        tv.setOnClickListener(_VClick(fn))
+        tv.setLayoutParams(self._lp(-2, self._dp(36), m=(4, 0, 4, 0)))
+        return tv
+
     def _badge(self, text):
         """卡片标题旁的小徽标，例如“使用中”。"""
         b = jclass("android.widget.TextView")(self._act)
@@ -1205,6 +1349,8 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         self._keep = []
         self._poll_token = None
         self._last_reload = 0.0
+        self._src_counts = {}
+        self._node_src = {}
 
     # --- 生命周期 ---
     def on_plugin_load(self):
@@ -1435,7 +1581,7 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
     def _manage(self):
         def build():
             srcs = self._load_sources()
-            labels = ["＋ 添加订阅 / 节点链接"]
+            labels = ["＋ 添加订阅", "＋ 导入单个节点（粘贴链接）"]
             labels += ["%s  ·  %s" % (s["name"] or "未命名", _short(s["value"])) for s in srcs]
             if srcs:
                 labels.append("🗑 清空全部")
@@ -1443,10 +1589,12 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
             def pick(i):
                 if i == 0:
                     self._edit_source(None)
-                elif i <= len(srcs):
-                    self._source_menu(i - 1)
+                elif i == 1:
+                    self._import_nodes()
+                elif i <= len(srcs) + 1:
+                    self._source_menu(i - 2)
                 else:
-                    self._save_and_apply([], "已清空所有订阅")
+                    self._save_and_apply([], "已清空所有订阅", quiet=True)
             list_dialog("订阅管理 (%d)" % len(srcs), labels, pick)
         threading.Thread(target=build, daemon=True).start()
 
@@ -1454,16 +1602,26 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         srcs = self._load_sources()
         if idx >= len(srcs):
             return
+        src = srcs[idx]
+        items = []
+        if _is_sub_url(src["value"]):
+            items += [("更新此订阅", "upd"), ("只看此订阅的节点", "view")]
+        items += [("编辑", "edit"), ("删除", "del")]
 
         def pick(i):
-            if i == 0:
+            act = items[i][1]
+            if act == "upd":
+                self._busy_run("正在更新订阅…", lambda: self._update_source(idx))
+            elif act == "view":
+                self._run_bg(lambda: self._use_src("s%d" % idx))
+            elif act == "edit":
                 self._edit_source(idx)
             else:
                 cur = self._load_sources()
                 if idx < len(cur):
                     removed = cur.pop(idx)
-                    self._save_and_apply(cur, "已删除: " + (removed["name"] or "订阅"))
-        list_dialog(srcs[idx]["name"] or "订阅", ["编辑", "删除"], pick)
+                    self._save_and_apply(cur, "已删除: " + (removed["name"] or "订阅"), quiet=True)
+        list_dialog(src["name"] or "订阅", [t for t, _ in items], pick)
 
     def _edit_source(self, idx):
         srcs = self._load_sources()
@@ -1478,22 +1636,100 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
             item = {"name": name or _default_name(value, len(lst) + 1), "value": value}
             if idx is not None and idx < len(lst):
                 lst[idx] = item
+                at = idx
             else:
                 lst.append(item)
-            self._save_and_apply(lst, "已保存: " + item["name"])
+                at = len(lst) - 1
+            self._save_and_apply(lst, "已保存: " + item["name"], fetch_idx=at)
         input_dialog("编辑订阅" if idx is not None else "添加订阅",
                      ["名称（可选）", "订阅地址 或 节点链接（可多条，空格/换行分隔）"],
                      [cur["name"], cur["value"]], ok, lines=[1, 4])
 
-    def _save_and_apply(self, sources, tip):
+    def _import_nodes(self):
+        """导入单个（或几个）节点分享链接；每个节点是一个独立条目，可单独编辑 / 删除。"""
+        clip = _clipboard_text().strip()
+        pre = clip if any(_is_node_link(t) for t in re.split(r"\s+", clip) if t) else ""
+
+        def ok(vals):
+            name = vals[0].strip()
+            toks = [t for t in re.split(r"\s+", vals[1].strip()) if t]
+            if not toks:
+                _toast("请粘贴节点链接")
+                return False
+            if any(_is_sub_url(t) for t in toks):
+                _toast("这是订阅地址，请用“添加订阅”")
+                return False
+            bad = [t for t in toks if not _is_node_link(t)]
+            if bad:
+                _toast("无法识别的链接：" + bad[0][:30])
+                return False
+            lst = self._load_sources()
+            for t in toks:
+                lst.append({"name": name if (name and len(toks) == 1) else _node_link_name(t),
+                            "value": t})
+            self._save_and_apply(lst, "已导入 %d 个节点" % len(toks), quiet=True)
+        input_dialog("导入单个节点",
+                     ["名称（可选）", "节点链接（vmess:// vless:// trojan:// ss:// hysteria2:// tuic://）"],
+                     ["", pre], ok, lines=[1, 3])
+
+    def _update_source(self, idx):
+        """只更新某一个订阅，不动其它订阅。"""
+        srcs = self._load_sources()
+        if idx >= len(srcs):
+            raise RuntimeError("订阅不存在")
+        src = srcs[idx]
+        if not _is_sub_url(src["value"]):
+            raise RuntimeError("这是单个节点，不需要更新")
+        name = src["name"] or "订阅"
+        kind, pid = self._kind(), "s%d" % idx
+        pp = self._port if self._started else 0
+        if kind == "mihomo" and self._started and self._api is not None:
+            # 内核在运行：让内核只刷新这一个 provider
+            self._api.req("PUT", "/providers/proxies/" + _q(pid), timeout=60)
+            data = self._api.req("GET", "/providers/proxies/" + _q(pid)) or {}
+            count = len(data.get("proxies") or [])
+        else:
+            ua = "clash.meta" if kind == "mihomo" else "v2rayN/7.0"
+            text = _http_get(src["value"], 30, pp, ua).decode("utf-8", "replace")
+            if kind == "singbox":
+                uris = parse_subscription_text(text)  # 不支持的格式（如 Clash YAML）会在这里报错
+                count = 0
+                for u in uris:
+                    try:
+                        uri_to_outbound(u)
+                        count += 1
+                    except Exception:
+                        continue
+            else:
+                count = len(node_infos_from_text(text))
+            if not count:
+                raise RuntimeError("订阅「%s」内容无法解析或为空，已保留旧数据" % name)
+            path = os.path.join(_home(), "%s.%s" % (pid, "yaml" if kind == "mihomo" else "sub"))
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            if kind == "singbox" and self._started:
+                self._start()  # sing-box 的节点写在配置里，运行中需要重启才生效
+        _info("订阅「%s」已更新：%d 个节点" % (name, count))
+        self._ui_refresh()
+
+    def _save_and_apply(self, sources, tip, quiet=False, fetch_idx=None):
         def go():
             self._save_sources(sources)
+            self._set("cur_src", "")  # 订阅序号可能变化，清掉“只看某个订阅”
+            if str(self.get_setting("last_pick", "") or "").startswith("S:"):
+                self._set("last_pick", "AUTO")
             _info(tip)
             try:
                 if sources and self._started:
-                    self._refresh()
+                    if quiet:
+                        self._start()
+                    else:
+                        self._refresh()
                 elif not sources and self._started:
                     self._stop(restore_tg=True)
+                elif (sources and fetch_idx is not None and fetch_idx < len(sources)
+                      and _is_sub_url(sources[fetch_idx]["value"])):
+                    self._update_source(fetch_idx)  # 没连接时也先把订阅下载下来，节点列表才有内容
             except Exception as e:
                 _err(str(e))
             self._ui_refresh()
@@ -1626,8 +1862,13 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
             home = _home()
             secret = os.urandom(8).hex()
             groups = self._groups_for_config(set(self._scan_node_infos()))
+            scopes = {}
+            for i, src in enumerate(sources):  # 已知有节点的订阅 / 单节点，才生成对应的自动选择组
+                if self._src_counts.get(i):
+                    key = ("s%d" % i) if _is_sub_url(src["value"]) else "nodes"
+                    scopes.setdefault(key, []).append("s%d" % i)
             if kind == "mihomo":
-                cfg, meta = build_mihomo_config(sources, port, ctl_port, secret, home, groups)
+                cfg, meta = build_mihomo_config(sources, port, ctl_port, secret, home, groups, scopes)
             else:
                 cfg, meta = build_singbox_config(sources, port, ctl_port, secret, home, force, groups)
             cfg_path = os.path.join(home, "config_%s.json" % kind)
@@ -1829,7 +2070,7 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
 
     # --- 数据 ---
     def _scan_node_infos(self):
-        home, out = _home(), {}
+        home, out, counts, node_src = _home(), {}, {}, {}
         if len(self._info_cache) > 16:
             self._info_cache = {}
         for i, src in enumerate(self._load_sources()):
@@ -1838,14 +2079,13 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
                 if _is_sub_url(value):
                     paths = [os.path.join(home, "s%d.%s" % (i, e)) for e in ("sub", "yaml")]
                     paths = [x for x in paths if os.path.exists(x)]
-                    if not paths:
-                        continue
-                    path = max(paths, key=os.path.getmtime)
-                    key = (path, os.path.getmtime(path))
-                    if key not in self._info_cache:
-                        with open(path, encoding="utf-8", errors="replace") as f:
-                            self._info_cache[key] = node_infos_from_text(f.read())
-                    infos = self._info_cache[key]
+                    if paths:
+                        path = max(paths, key=os.path.getmtime)
+                        key = (path, os.path.getmtime(path))
+                        if key not in self._info_cache:
+                            with open(path, encoding="utf-8", errors="replace") as f:
+                                self._info_cache[key] = node_infos_from_text(f.read())
+                        infos = self._info_cache[key]
                 else:
                     key = ("links", value)
                     if key not in self._info_cache:
@@ -1853,8 +2093,18 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
                     infos = self._info_cache[key]
             except Exception as e:
                 self.log("scan nodes: %s" % e)
+            counts[i] = len(infos)
             for name, info in infos:
                 out.setdefault(name, info)
+                node_src.setdefault(name, i)
+        self._src_counts, self._node_src = counts, node_src  # 节点名 -> 来源序号，用于“只看某个订阅”
+        return out
+
+    def _scope_counts(self):
+        out = {}
+        for i, s in enumerate(self._load_sources()):
+            key = ("s%d" % i) if _is_sub_url(s["value"]) else "nodes"
+            out[key] = out.get(key, 0) + self._src_counts.get(i, 0)
         return out
 
     def _collect(self):
@@ -1873,16 +2123,34 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         snap["groups"], snap["cur_group"] = groups, cur
         snap["cols"] = 2 if str(self.get_setting("cols", "1")) == "2" else 1
         infos = self._scan_node_infos()
+        sources = self._load_sources()
+        scopes, node_scope = [], {}
+        for i, src in enumerate(sources):
+            if _is_sub_url(src["value"]):
+                scopes.append({"key": "s%d" % i, "label": src["name"] or ("订阅%d" % (i + 1)),
+                               "count": self._src_counts.get(i, 0)})
+        n_single = sum(self._src_counts.get(i, 0) for i, x in enumerate(sources)
+                       if not _is_sub_url(x["value"]))
+        if any(not _is_sub_url(x["value"]) for x in sources):
+            scopes.append({"key": "nodes", "label": "单节点", "count": n_single})
+        for name, i in self._node_src.items():
+            if i < len(sources):
+                node_scope[name] = ("s%d" % i) if _is_sub_url(sources[i]["value"]) else "nodes"
+        cur_src = str(self.get_setting("cur_src", "") or "")
+        if cur_src not in {x["key"] for x in scopes}:
+            cur_src = ""
+        snap["scopes"], snap["node_scope"], snap["cur_src"] = scopes, node_scope, cur_src
         names = []
         if running and self._api is not None:
             try:
                 d = self._api.req("GET", "/proxies/PROXY") or {}
                 snap["now"] = d.get("now", "")
                 names = [n for n in (d.get("all") or [])
-                         if n not in ("AUTO", "DIRECT", "direct") and n not in gset]
+                         if n not in ("AUTO", "DIRECT", "direct") and n not in gset
+                         and not n.startswith("S:")]
                 # 当前选的是“自动 / 分组”时，顺着往下找出真正在用的节点
                 node, hops = snap["now"], 0
-                while node and (node == "AUTO" or node in gset) and hops < 3:
+                while node and (node == "AUTO" or node in gset or node.startswith("S:")) and hops < 3:
                     node = (self._api.req("GET", "/proxies/" + _q(node)) or {}).get("now", "")
                     hops += 1
                 snap["active"] = node
@@ -1967,55 +2235,57 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
                 r.addView(self._button(text, "outline", fn, h=44, weight=1, m=(4, 4, 4, 4), sp=14))
             ct.addView(r)
         tools([("内核：" + snap["label"], lambda: self._choose_core()),
-               ("订阅管理", lambda: self._manage())])
-        tools([("更新订阅", lambda: self._busy_run("正在更新订阅…", self._refresh)),
                ("更新核心", lambda: self._busy_run(
                    "正在更新核心…", lambda: self._install_or_update(self._kind())))])
+        tools([("订阅管理", lambda: self._manage()),
+               ("导入节点", lambda: self._import_nodes())])
+        tools([("更新全部订阅", lambda: self._busy_run("正在更新订阅…", self._refresh)),
+               ("分组管理", lambda: self._group_manage())])
 
         cols = snap["cols"]
-        tools([("分组管理", lambda: self._group_manage()),
-               ("布局：" + ("双列" if cols == 2 else "单列"), lambda: self._toggle_cols())])
 
-        # 分组芯片（点击即“使用该分组”）
+        def chip_row(items):
+            hs = jclass("android.widget.HorizontalScrollView")(self._act)
+            hs.setHorizontalScrollBarEnabled(False)
+            crow = self._hbox()
+            crow.setPadding(self._dp(10), self._dp(6), self._dp(10), self._dp(6))
+            for text, sel, fn in items:
+                crow.addView(self._chip(text, sel, fn))
+            hs.addView(crow)
+            ct.addView(hs)
+
+        # 订阅标签（点击即“只看这个订阅”）
+        scopes, cur_src = snap["scopes"], snap["cur_src"]
+        if len(scopes) >= 2:
+            items = [("全部订阅", cur_src == "", lambda: self._run_bg(lambda: self._use_src("")))]
+            for sc in scopes:
+                items.append(("%s（%d）" % (sc["label"], sc["count"]), cur_src == sc["key"],
+                              (lambda key: (lambda: self._run_bg(lambda: self._use_src(key))))(sc["key"])))
+            chip_row(items)
+
+        # 分组标签（点击即“使用该分组”）
         groups, cur = snap["groups"], snap["cur_group"]
         all_names = {n["name"] for n in snap["nodes"]}
-        hs = jclass("android.widget.HorizontalScrollView")(self._act)
-        hs.setHorizontalScrollBarEnabled(False)
-        crow = self._hbox()
-        crow.setPadding(self._dp(10), self._dp(6), self._dp(10), self._dp(6))
-
-        def chip(text, sel, fn):
-            tv = jclass("android.widget.TextView")(self._act)
-            tv.setText(text)
-            tv.setTextSize(14.0)
-            tv.setGravity(17)
-            tv.setTypeface(jclass("android.graphics.Typeface").DEFAULT_BOLD)
-            tv.setPadding(self._dp(16), 0, self._dp(16), 0)
-            if sel:
-                tv.setBackground(self._shape("blue", 18))
-                tv.setTextColor(jclass("android.graphics.Color").WHITE)
-            else:
-                tv.setBackground(self._shape("card", 18, "outline", sw=1))
-                tv.setTextColor(self._c("accent"))
-            tv.setClickable(True)
-            tv.setOnClickListener(_VClick(fn))
-            tv.setLayoutParams(self._lp(-2, self._dp(36), m=(4, 0, 4, 0)))
-            crow.addView(tv)
-        chip("全部", cur == "", lambda: self._run_bg(lambda: self._use_group("")))
+        items = [("全部分组", cur == "", lambda: self._run_bg(lambda: self._use_group("")))]
         for g in groups:
             valid = len([x for x in g["nodes"] if x in all_names])
-            chip("%s（%d）" % (g["name"], valid), cur == g["name"],
-                 (lambda nm: (lambda: self._run_bg(lambda: self._use_group(nm))))(g["name"]))
-        chip("＋ 新建分组", False, lambda: self._group_new())
-        hs.addView(crow)
-        ct.addView(hs)
+            items.append(("%s（%d）" % (g["name"], valid), cur == g["name"],
+                          (lambda nm: (lambda: self._run_bg(lambda: self._use_group(nm))))(g["name"])))
+        items.append(("＋ 新建分组", False, lambda: self._group_new()))
+        chip_row(items)
 
-        # 当前分组过滤
+        # 过滤：订阅范围 + 分组（取交集）
         members = None
         if cur:
             g = next((x for x in groups if x["name"] == cur), None)
             members = set(g["nodes"]) if g else None
-        nodes = snap["nodes"] if members is None else [n for n in snap["nodes"] if n["name"] in members]
+        nodes = snap["nodes"]
+        scope_label = ""
+        if cur_src:
+            nodes = [n for n in nodes if snap["node_scope"].get(n["name"]) == cur_src]
+            scope_label = next((x["label"] for x in scopes if x["key"] == cur_src), "")
+        if members is not None:
+            nodes = [n for n in nodes if n["name"] in members]
 
         if not snap["nodes"]:
             c = self._card()
@@ -2026,19 +2296,25 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         else:
             head = self._hbox()
             head.setPadding(self._dp(24), self._dp(12), self._dp(24), self._dp(4))
-            title = ("分组「%s」· 节点（%d）" % (cur, len(nodes))) if members is not None \
-                else "节点（%d）" % len(nodes)
-            t = self._text(title, 14, "sub", True)
+            parts = []
+            if cur_src:
+                parts.append("订阅「%s」" % scope_label)
+            if members is not None:
+                parts.append("分组「%s」" % cur)
+            title = (" · ".join(parts) + " · " if parts else "") + "节点（%d）" % len(nodes)
+            t = self._text(title, 14, "sub", True, lines=2)
             t.setLayoutParams(self._lp(0, -2, weight=1))
             head.addView(t)
+            head.addView(self._small_button("布局：" + ("双列" if cols == 2 else "单列"),
+                                            lambda: self._toggle_cols()))
             head.addView(self._small_button("全部测速", lambda: self._run_bg(self._test_all)))
             ct.addView(head)
 
             now = snap["now"]
-            auto_target = ("G:" + cur) if members is not None else "AUTO"
-            if members is not None and not nodes:
+            auto_target = ("G:" + cur) if members is not None else (("S:" + cur_src) if cur_src else "AUTO")
+            if (members is not None or cur_src) and not nodes:
                 c = self._card()
-                c.addView(self._text("分组「%s」里没有可用节点，请在“分组管理”里重新勾选" % cur, 15, "sub"))
+                c.addView(self._text("当前筛选下没有可用节点：可以换个订阅 / 分组，或在“分组管理”里重新勾选", 15, "sub"))
                 ct.addView(c)
             else:
                 auto_sel = running and now == auto_target
@@ -2050,11 +2326,13 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
                 col.setPadding(self._dp(16), 0, 0, 0)
                 col.addView(self._text(
                     ("✔ " if auto_sel else "") +
-                    ("自动选择最快（分组：%s）" % cur if members is not None else "自动选择最快节点"),
+                    ("自动选择最快（分组：%s）" % cur if members is not None
+                     else ("自动选择最快（订阅：%s）" % scope_label if cur_src else "自动选择最快节点")),
                     18, "text", True))
                 col.addView(self._text(
                     "URLTEST · 只在该分组内测速选择" if members is not None
-                    else "URLTEST · 每 5 分钟自动检测", 14, "accent"))
+                    else ("URLTEST · 只在该订阅内测速选择" if cur_src
+                          else "URLTEST · 每 5 分钟自动检测"), 14, "accent"))
                 col.addView(self._text(
                     ("使用中：" + snap["active"]) if (auto_sel and snap["active"])
                     else ("当前使用" if auto_sel else "点击使用"), 14, "sub", lines=2))
@@ -2186,21 +2464,39 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
                 members = next((g["nodes"] for g in self._load_groups() if g["name"] == pick[2:]), [])
                 if not any(m in allv for m in members):
                     return
+            elif pick.startswith("S:") and not self._scope_counts().get(pick[2:]):
+                return
             api.req("PUT", "/proxies/PROXY", {"name": pick})
         except Exception as e:
             self.log("restore pick: %s" % e)
 
-    def _use_group(self, name):
-        """使用当前分组：名称为空表示“全部”（回到全局自动选择）。"""
-        self.set_setting("cur_group", name)
-        target = ("G:" + name) if name else "AUTO"
+    def _scope_target(self):
+        """当前“自动选择”的目标：分组优先，其次是选中的订阅，最后是全局 AUTO。"""
+        g = str(self.get_setting("cur_group", "") or "")
+        if g:
+            return "G:" + g
+        src = str(self.get_setting("cur_src", "") or "")
+        return ("S:" + src) if src else "AUTO"
+
+    def _apply_scope(self):
+        target = self._scope_target()
         self.set_setting("last_pick", target)
         if self._started and self._api is not None:
             try:
                 self._api.req("PUT", "/proxies/PROXY", {"name": target})
             except Exception as e:
-                _err("切换分组失败: %s" % e)
+                _err("切换失败: %s（请先点“更新订阅”让内核生成对应的分组）" % e)
         self._ui_refresh()
+
+    def _use_group(self, name):
+        """使用当前分组：名称为空表示“全部分组”。"""
+        self.set_setting("cur_group", name)
+        self._apply_scope()
+
+    def _use_src(self, key):
+        """只看（并只在其内自动选择）某个订阅；空表示“全部订阅”。"""
+        self.set_setting("cur_src", key)
+        self._apply_scope()
 
     def _apply_groups(self, groups, tip):
         self._save_groups(groups)
@@ -2265,7 +2561,7 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
             elif idx < len(groups):
                 groups[idx] = item
             self._apply_groups(groups, "分组「%s」已保存（%d 个节点）" % (name, len(item["nodes"])))
-        multi_dialog("勾选「%s」的节点（%d）" % (name, len(names)), names, checked, ok)
+        multi_dialog("勾选「%s」的节点（%d）" % (name, len(names)), names, checked, ok, searchable=True)
 
     def _group_rename(self, idx):
         groups = self._load_groups()
