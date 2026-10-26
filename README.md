@@ -5,7 +5,7 @@
 月付通通低至两月🎉好吃😋不贵量大管饱
 
 插件实况
-![项目图片](./images/2.png)
+![项目图片](./images/2.jpg)
 # Proxy Core
 
 给 Telegram Android 客户端（NagramX / exteraGram 一类支持 Python 插件的客户端）用的代理插件。
