@@ -197,17 +197,23 @@ def _port_free(p):
         s.close()
 
 
-def pick_ports(backup):
-    """优先使用内置 9090，设置端口只作为备用，不做端口顺延。"""
-    backup = int(backup)
-    candidates = [(9090, 9091)]
-    if backup != 9090:
-        candidates.append((backup, backup + 1))
-    for proxy_port, ctl_port in candidates:
-        if (1024 <= proxy_port <= 65534 and _port_free(proxy_port)
-                and _port_free(ctl_port)):
-            return proxy_port, ctl_port
-    raise RuntimeError("内置端口 9090 和备用端口都被占用，请更换备用端口")
+def pick_ports(start=7890):
+    """从起始端口顺延，代理端口与控制端口使用相邻端口。"""
+    start = max(1024, int(start))
+    for proxy_port in range(start, 65535):
+        if _port_free(proxy_port) and _port_free(proxy_port + 1):
+            return proxy_port, proxy_port + 1
+    raise RuntimeError("从端口 %d 开始没有可用的连续端口" % start)
+
+
+def _wait_ports_free(ports, timeout=3, interval=0.1):
+    ports = [p for p in ports if 1024 <= p <= 65535]
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if all(_port_free(p) for p in ports):
+            return True
+        time.sleep(interval)
+    return not any(not _port_free(p) for p in ports)
 
 
 # ---------- mihomo 配置 ----------
@@ -1362,7 +1368,27 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
     def on_plugin_load(self):
         self._register_menu()
         if _as_bool(self.get_setting("enabled", False)):
-            self._run_async(self._start, quiet=True)
+            self._run_async(self._auto_start, quiet=True)
+
+    def _auto_start(self):
+        """应用快速重开时，等待旧内核释放后自动重试。"""
+        for attempt in range(1, 9):
+            if not _as_bool(self.get_setting("enabled", False)):
+                return
+            try:
+                self._start()
+                return
+            except NeedRestart:
+                raise
+            except Exception as e:
+                text = str(e).lower()
+                busy = any(x in text for x in (
+                    "端口", "port", "address already in use", "eaddrinuse",
+                    "bind", "listen", "仍在断开"))
+                if not busy or attempt == 8:
+                    raise
+                self.log("自动启动等待旧内核释放（%d/8）: %s" % (attempt, e))
+                time.sleep(1)
 
     def on_plugin_unload(self):
         for i in list(self._menu_ids):
@@ -1377,7 +1403,13 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         except Exception:
             pass
         try:
-            self._stop(restore_tg=True)
+            with self._lock:
+                self._stop_locked(async_stop=False, force=True)
+                ports = [7890, 7891]
+                if self._port:
+                    ports.extend((self._port, self._port + 1))
+                _wait_ports_free(ports, 3, 0.05)
+            self._restore_tg_proxy()
         except Exception as e:
             self.log("ProxyCore unload: %s" % e)
 
@@ -1518,7 +1550,7 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         return row
 
     def _settings_run_items(self):
-        port = str(self.get_setting("port", "17891"))
+        port = str(self.get_setting("port", "7890"))
         auto = _as_bool(self.get_setting("enabled", False))
         if Custom is not None:
             try:
@@ -1528,13 +1560,13 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
                 sw.setChecked(bool(auto))
                 sw.setOnCheckedChangeListener(_Check(self._on_auto))
                 return [
-                    Custom(view=self._setting_row(k, "本地端口", "优先使用 9090，被占用时使用备用端口", pill)),
+                    Custom(view=self._setting_row(k, "本地端口", "从 7890 开始被占用时自动顺延 +1", pill)),
                     Custom(view=self._setting_row(k, "自动连接", "随客户端启动时自动连接（记住上次状态）", sw)),
                 ]
             except Exception as e:
                 self.log("settings rows: %s" % e)
         return [
-            self._mk(Input, key="port", text="本地端口", subtext="优先使用 9090，被占用时使用备用端口",
+            self._mk(Input, key="port", text="本地端口", subtext="从 7890 开始被占用时自动顺延 +1",
                      icon="msg_language", default=port,
                      on_change=lambda v: self.set_setting("port", v)),
             self._mk(Switch, key="enabled", text="自动连接",
@@ -1555,7 +1587,7 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
             self._set("port", v, reload=True)  # 重建设置页，让按钮显示新端口
             _toast("端口已保存，重新连接后生效")
         input_dialog("本地端口", ["端口（1024–65000）"],
-                     [str(self.get_setting("port", "17891"))], ok)
+                     [str(self.get_setting("port", "7890"))], ok)
 
     # --- 订阅数据 ---
     def _load_sources(self):
@@ -1820,30 +1852,34 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         self.set_setting("enabled", False)
         _info("内核已停止，Telegram 代理设置已恢复" if was else "内核当前没有运行")
 
-    def _stop_locked(self, async_stop=True):
-        if _LIB_FUNCS is not None and self._started and not self._stopping:
+    def _stop_locked(self, async_stop=True, force=False):
+        if _LIB_FUNCS is not None and (self._started or force):
             stop_fn = _LIB_FUNCS[1]
             if async_stop:
                 # 用户主动断开时不等待原生 Stop，避免面板长时间卡在“正在断开”。
-                self._stopping = True
+                if not self._stopping:
+                    self._stopping = True
 
-                def stop_worker():
-                    try:
-                        stop_fn()
-                    except Exception as e:
-                        self.log("ProxyCore stop: %s" % e)
-                    finally:
-                        self._stopping = False
+                    def stop_worker():
+                        try:
+                            stop_fn()
+                        except Exception as e:
+                            self.log("ProxyCore stop: %s" % e)
+                        finally:
+                            self._stopping = False
 
-                threading.Thread(target=stop_worker, name="proxy-core-stop", daemon=True).start()
+                    threading.Thread(target=stop_worker, name="proxy-core-stop", daemon=True).start()
             else:
-                # 启动前清理旧实例必须保持顺序，避免新旧内核并行。
+                wait_deadline = time.time() + 3
+                while self._stopping and time.time() < wait_deadline:
+                    time.sleep(0.05)
                 try:
                     stop_fn()
                 except Exception as e:
                     self.log("ProxyCore stop: %s" % e)
         self._started = False
         self._api = None
+        self._port = 0
 
     def _stop(self, restore_tg):
         with self._lock:
@@ -1885,9 +1921,15 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
             if not sources:
                 raise RuntimeError("还没有添加订阅或节点，请先在“订阅管理”里添加")
             funcs = _load_lib(kind)  # 未安装 / 需重启会在这里抛出
-            self._stop_locked(async_stop=False)  # 启动前同步清理旧实例，再选端口
-            backup = int(str(self.get_setting("port", "17891")).strip())
-            port, ctl_port = pick_ports(backup)
+            self._stop_locked(async_stop=False, force=True)  # 即使状态丢失也停止本进程中的旧内核
+            start_port = int(str(self.get_setting("port", "7890")).strip() or "7890")
+            # Stop() 后等待旧监听释放，然后从设置的起始端口逐个顺延寻找连续端口。
+            try:
+                port, ctl_port = pick_ports(start_port)
+            except RuntimeError:
+                if not _wait_ports_free((start_port, start_port + 1), 3):
+                    raise RuntimeError("内核已请求停止，但从 7890 开始的端口仍被占用")
+                port, ctl_port = pick_ports(start_port)
             home = _home()
             secret = os.urandom(8).hex()
             groups = self._groups_for_config(set(self._scan_node_infos()))
@@ -1906,16 +1948,25 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
             rc = funcs[0](home.encode(), cfg_path.encode())
             if rc != 0:
                 msg = (funcs[2]() or b"").decode("utf-8", "replace")
-                raise RuntimeError("内核启动失败(%d): %s" % (rc, msg))
-            deadline = time.time() + 12
+                lower_msg = msg.lower()
+                if any(x in lower_msg for x in ("address already in use", "eaddrinuse", "bind", "listen", "port in use")):
+                    # 初始化阶段才发现旧监听未释放时，停止并在同一端口重试。
+                    self._stop_locked(async_stop=False, force=True)
+                    if _wait_ports_free((port, ctl_port), 3, 0.05):
+                        rc = funcs[0](home.encode(), cfg_path.encode())
+                        msg = (funcs[2]() or b"").decode("utf-8", "replace") if rc != 0 else ""
+                if rc != 0:
+                    raise RuntimeError("内核启动失败(%d): %s" % (rc, msg))
+            deadline = time.time() + 6
             while time.time() < deadline:
                 try:
                     socket.create_connection(("127.0.0.1", port), 0.5).close()
                     break
                 except OSError:
-                    time.sleep(0.3)
+                    time.sleep(0.15)
             else:
-                funcs[1]()
+                # 启动失败时后台释放，避免再次同步阻塞界面。
+                threading.Thread(target=funcs[1], name="proxy-core-failed-stop", daemon=True).start()
                 raise RuntimeError("本地端口 %d 未就绪" % port)
             self._started, self._running_kind, self._port = True, kind, port
             self._api = Api(ctl_port, secret)
@@ -1924,8 +1975,8 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
             set_tg_proxy(True, "127.0.0.1", port)
             self._delay = {}
             self._restore_pick()
-            if port != 9090:
-                _info("内置端口 9090 被占用，已使用备用端口 %d" % port)
+            if port != 7890:
+                _info("端口 7890 被占用，已顺延使用端口 %d（控制端口 %d）" % (port, ctl_port))
         self._ui_refresh()
 
     def _ensure_running(self):
@@ -1977,24 +2028,21 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
 
     @staticmethod
     def _delays(api, names):
-        try:
-            d = api.req("GET", "/group/AUTO/delay?url=%s&timeout=5000" % _q(HC_URL), timeout=30)
-            if isinstance(d, dict) and d:
-                return d
-        except Exception:
-            pass
-        res = {}
+        """逐节点测速；分组 delay 接口只返回一个结果，不能用于整批节点。"""
+        names = list(dict.fromkeys(names))
+        if not names:
+            return {}
 
         def one(n):
             try:
                 r = api.req("GET", "/proxies/%s/delay?url=%s&timeout=5000" % (_q(n), _q(HC_URL)),
-                            timeout=10)
-                res[n] = int((r or {}).get("delay", 0))
+                            timeout=8)
+                return n, int((r or {}).get("delay", 0))
             except Exception:
-                res[n] = 0
-        with ThreadPoolExecutor(max_workers=16) as ex:
-            list(ex.map(one, names))
-        return res
+                return n, 0
+
+        with ThreadPoolExecutor(max_workers=min(8, len(names))) as ex:
+            return dict(ex.map(one, names))
 
     # --- 打开 / 刷新 ---
     def _open_dashboard(self):
@@ -2718,7 +2766,23 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
     def _test_all(self):
         if not self._started or self._api is None:
             raise RuntimeError("请先连接")
-        names = [n["name"] for n in (self._snap or {}).get("nodes", [])]
+        snap = self._snap or {}
+        nodes = snap.get("nodes", [])
+        cur_src = str(self.get_setting("cur_src", "") or "")
+        scopes = {x["key"] for x in snap.get("scopes", [])}
+        if cur_src not in scopes:
+            cur_src = ""
+        cur_group = str(self.get_setting("cur_group", "") or "")
+        groups = snap.get("groups", [])
+        group = next((g for g in groups if g["name"] == cur_group), None)
+        members = set(group["nodes"]) if group else None
+        names = [n["name"] for n in nodes
+                 if (not cur_src or snap.get("node_scope", {}).get(n["name"]) == cur_src)
+                 and (members is None or n["name"] in members)]
+        if not names:
+            _toast("当前订阅和分组筛选下没有可测速节点")
+            return
+        api = self._api
         for n in names:
             self._delay[n] = -2
 
@@ -2726,7 +2790,7 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
             for n in names:
                 self._apply_delay(n)
         run_on_ui_thread(mark)
-        res = self._delays(self._api, names)
+        res = self._delays(api, names)
         for n in names:
             d = res.get(n)
             self._delay[n] = d if isinstance(d, int) and d > 0 else 0
