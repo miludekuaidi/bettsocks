@@ -700,9 +700,10 @@ def restart_app():
 
 # ---------- 控制接口（两个内核都兼容 Clash API） ----------
 class Api:
-    def __init__(self, ctl_port, secret):
+    def __init__(self, ctl_port, secret, kind=""):
         self.base = "http://127.0.0.1:%d" % ctl_port
         self.secret = secret
+        self.kind = kind
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def req(self, method, path, body=None, timeout=10):
@@ -1969,7 +1970,7 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
                 threading.Thread(target=funcs[1], name="proxy-core-failed-stop", daemon=True).start()
                 raise RuntimeError("本地端口 %d 未就绪" % port)
             self._started, self._running_kind, self._port = True, kind, port
-            self._api = Api(ctl_port, secret)
+            self._api = Api(ctl_port, secret, kind)
             self._meta = meta
             self._save_prev_proxy()
             set_tg_proxy(True, "127.0.0.1", port)
@@ -2027,22 +2028,39 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         return [n for n in (data.get("all") or []) if n not in ("AUTO", "DIRECT", "direct")]
 
     @staticmethod
+    def _delay_one(api, name):
+        path = "/proxies/%s/delay?url=%s&timeout=15000" % (_q(name), _q(HC_URL))
+        last_error = None
+        for attempt in range(2 if getattr(api, "kind", "") == "mihomo" else 1):
+            try:
+                r = api.req("GET", path, timeout=18) or {}
+                delay = int(r.get("delay", 0) or 0)
+                if delay > 0:
+                    return delay
+            except Exception as e:
+                last_error = e
+            if attempt == 0:
+                time.sleep(0.5)
+        if getattr(api, "kind", "") == "mihomo":
+            try:
+                data = api.req("GET", "/proxies/%s" % _q(name), timeout=5) or {}
+                for item in reversed(data.get("history", []) or []):
+                    delay = int(item.get("delay", 0) or 0)
+                    if delay > 0:
+                        return delay
+            except Exception as e:
+                last_error = e
+        return 0
+
+    @staticmethod
     def _delays(api, names):
-        """逐节点测速；分组 delay 接口只返回一个结果，不能用于整批节点。"""
+        """通过内核 Clash API 逐节点测速；mihomo 失败时重试并读取历史延迟。"""
         names = list(dict.fromkeys(names))
         if not names:
             return {}
-
-        def one(n):
-            try:
-                r = api.req("GET", "/proxies/%s/delay?url=%s&timeout=5000" % (_q(n), _q(HC_URL)),
-                            timeout=8)
-                return n, int((r or {}).get("delay", 0))
-            except Exception:
-                return n, 0
-
-        with ThreadPoolExecutor(max_workers=min(8, len(names))) as ex:
-            return dict(ex.map(one, names))
+        with ThreadPoolExecutor(max_workers=min(4, len(names))) as ex:
+            return dict((n, d) for n, d in
+                        zip(names, ex.map(lambda n: ProxyCorePlugin._delay_one(api, n), names)))
 
     # --- 打开 / 刷新 ---
     def _open_dashboard(self):
@@ -2755,9 +2773,7 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         self._delay[name] = -2
         run_on_ui_thread(lambda: self._apply_delay(name))
         try:
-            r = self._api.req("GET", "/proxies/%s/delay?url=%s&timeout=5000" % (_q(name), _q(HC_URL)),
-                              timeout=10)
-            d = int((r or {}).get("delay", 0))
+            d = self._delay_one(self._api, name)
         except Exception:
             d = 0
         self._delay[name] = d if d > 0 else 0
