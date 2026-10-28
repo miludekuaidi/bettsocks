@@ -18,6 +18,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 
 from base_plugin import BasePlugin
@@ -45,6 +46,10 @@ NotificationCenter = jclass("org.telegram.messenger.NotificationCenter")
 ConnectionsManager = jclass("org.telegram.tgnet.ConnectionsManager")
 
 HC_URL = "https://www.gstatic.com/generate_204"
+CONTROL_PORT_START = 19090
+CONTROL_PORT_END = 19099
+HC_URLS = (HC_URL, "https://cp.cloudflare.com/generate_204",
+           "https://www.google.com/generate_204")
 
 # 核心从这个项目的 Releases 自动获取最新版
 CORE_REPO = "miludekuaidi/bettsocks"
@@ -156,6 +161,13 @@ def _q(x):
     return urllib.parse.quote(str(x), safe="")
 
 
+def _node_name_key(value):
+    """Normalize display/API node names for matching across subscription parsers."""
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = urllib.parse.unquote(text)
+    return " ".join(text.strip().split()).casefold()
+
+
 _NODE_SCHEMES = ("vmess", "vless", "trojan", "ss", "ssr", "hysteria", "hysteria2", "hy2",
                  "tuic", "wireguard", "socks5", "anytls")
 
@@ -197,13 +209,25 @@ def _port_free(p):
         s.close()
 
 
-def pick_ports(start=7890):
-    """从起始端口顺延，代理端口与控制端口使用相邻端口。"""
+def pick_control_port():
+    """在 Zashboard 约定的控制端口范围内选择首个可用端口。"""
+    for port in range(CONTROL_PORT_START, CONTROL_PORT_END + 1):
+        if _port_free(port):
+            return port
+    raise RuntimeError("控制端口 19090-19099 均被占用")
+
+
+def pick_ports(start=7890, ctl_port=0):
+    """代理端口顺延；控制端口使用 19090-19099 范围内的端口。"""
     start = max(1024, int(start))
+    if not _port_free(ctl_port):
+        raise RuntimeError("控制端口 %d 被占用" % ctl_port)
     for proxy_port in range(start, 65535):
-        if _port_free(proxy_port) and _port_free(proxy_port + 1):
-            return proxy_port, proxy_port + 1
-    raise RuntimeError("从端口 %d 开始没有可用的连续端口" % start)
+        if proxy_port == ctl_port:
+            continue
+        if _port_free(proxy_port):
+            return proxy_port, ctl_port
+    raise RuntimeError("从端口 %d 开始没有可用的代理端口" % start)
 
 
 def _wait_ports_free(ports, timeout=3, interval=0.1):
@@ -264,7 +288,12 @@ def build_mihomo_config(sources, port, ctl_port, secret, home, groups=None, scop
     cfg = {
         "mixed-port": int(port),
         "bind-address": "127.0.0.1",
-        "external-controller": "127.0.0.1:%d" % int(ctl_port),
+        # Zashboard 通过 Clash API 管理内核；控制接口监听所有本机网络接口。
+        "external-controller": "0.0.0.0:%d" % int(ctl_port),
+        "external-controller-cors": {
+            "allow-origins": ["*"],
+            "allow-private-network": True,
+        },
         "secret": secret,
         "allow-lan": False,
         "mode": "rule",
@@ -274,8 +303,11 @@ def build_mihomo_config(sources, port, ctl_port, secret, home, groups=None, scop
         "unified-delay": True,
         "tcp-concurrent": True,
         "dns": {"enable": True, "ipv6": False,
-                "default-nameserver": ["223.5.5.5", "8.8.8.8"],
-                "nameserver": ["223.5.5.5", "8.8.8.8"]},
+                # 使用直连 UDP DNS，避免 DoH 域名解析失败导致节点和测速都不可用。
+                "default-nameserver": ["223.5.5.5", "119.29.29.29"],
+                "nameserver": ["223.5.5.5", "119.29.29.29"],
+                "fallback": ["8.8.8.8", "1.1.1.1"],
+                "fallback-filter": {"geoip": True, "geoip-code": "CN"}},  
         "proxy-providers": providers,
         "proxy-groups": [
             {"name": "PROXY", "type": "select", "proxies": ["AUTO"] + gnames + snames, "use": use},
@@ -298,7 +330,15 @@ def _qs(u):
 
 
 def _truthy(v):
-    return str(v).lower() in ("1", "true")
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _qfirst(q, *names):
+    for name in names:
+        value = q.get(name)
+        if value is not None and str(value).strip() != "":
+            return value
+    return ""
 
 
 def _tls(q, host, default_on):
@@ -424,19 +464,59 @@ def _ob_ss(uri):
 
 
 def _ob_hy2(uri):
+    """Convert hysteria2:// links to sing-box's QUIC outbound format.
+
+    Hysteria2 uses HTTP/3 over QUIC.  Some providers omit alpn because
+    clients normally supply the protocol default, so make h3 explicit here.
+    Accept the parameter aliases emitted by common subscription converters.
+    """
     u = urllib.parse.urlparse(uri)
     q = _qs(u)
     pw = urllib.parse.unquote(u.username or "")
     if u.password:
         pw += ":" + urllib.parse.unquote(u.password)
+    sni = _qfirst(q, "sni", "peer", "server_name") or u.hostname
+    insecure = any(_truthy(q.get(k, "")) for k in
+                   ("insecure", "allowInsecure", "allow_insecure"))
+    alpn = _qfirst(q, "alpn") or "h3"
+    tls = {"enabled": True, "server_name": sni,
+           "alpn": [x.strip() for x in alpn.split(",") if x.strip()] or ["h3"]}
+    if insecure:
+        tls["insecure"] = True
     ob = {"type": "hysteria2", "tag": urllib.parse.unquote(u.fragment) or "hysteria2",
           "server": u.hostname, "server_port": u.port or 443, "password": pw,
-          "tls": {"enabled": True, "server_name": q.get("sni") or u.hostname,
-                  "insecure": _truthy(q.get("insecure", ""))}}
-    if q.get("alpn"):
-        ob["tls"]["alpn"] = q["alpn"].split(",")
-    if q.get("obfs"):
-        ob["obfs"] = {"type": q["obfs"], "password": q.get("obfs-password", "")}
+          "tls": tls}
+    obfs_type = _qfirst(q, "obfs", "obfs_type")
+    if obfs_type:
+        obfs_password = _qfirst(q, "obfs-password", "obfs_password", "obfsPassword")
+        ob["obfs"] = {"type": obfs_type, "password": urllib.parse.unquote(obfs_password)}
+    for target, aliases in (
+            ("up_mbps", ("up", "upmbps", "up_mbps", "upMbps")),
+            ("down_mbps", ("down", "downmbps", "down_mbps", "downMbps")),
+            ("hop_interval", ("hop-interval", "hop_interval", "hopInterval"))):
+        value = _qfirst(q, *aliases)
+        if value:
+            if target in ("up_mbps", "down_mbps"):
+                try:
+                    ob[target] = int(str(value).lower().removesuffix("mbps"))
+                except ValueError:
+                    pass
+            else:
+                interval = str(value).strip()
+                ob[target] = interval if re.search(r"[a-zA-Z]", interval) else interval + "s"
+    ports = _qfirst(q, "mport", "ports", "port")
+    if ports:
+        port_items = []
+        for item in str(ports).split(","):
+            item = item.strip()
+            match = re.fullmatch(r"(\d+)-(\d+)", item)
+            if match:
+                item = match.group(1) + ":" + match.group(2)
+            if item:
+                port_items.append(item)
+        if port_items:
+            ob.pop("server_port", None)
+            ob["server_ports"] = port_items
     return ob
 
 
@@ -563,8 +643,23 @@ def build_singbox_config(sources, port, ctl_port, secret, home, force, groups=No
         snames.append(st)
     cfg = {
         "log": {"level": "warn"},
-        "dns": {"servers": [{"type": "udp", "tag": "dns-bootstrap", "server": "223.5.5.5"}],
-                "final": "dns-bootstrap"},
+        "dns": {"servers": [
+                    {"type": "https", "tag": "dns-domestic",
+                     "server": "doh.18bit.cn", "path": "/dns-query",
+                     "domain_resolver": "dns-bootstrap"},
+                    {"type": "https", "tag": "dns-domestic-2",
+                     "server": "dns.ipv4dns.com", "path": "/dns-query",
+                     "domain_resolver": "dns-bootstrap"},
+                    {"type": "https", "tag": "dns-foreign",
+                     "server": "8.8.8.8", "path": "/dns-query",
+                     "tls": {"server_name": "dns.google"},
+                     "domain_resolver": "dns-bootstrap"},
+                    {"type": "udp", "tag": "dns-bootstrap", "server": "223.5.5.5"}],
+                # 使用新版 sing-box 支持的域名后缀匹配，不再依赖已弃用的 geosite 数据库
+                "rules": [{"domain_suffix": [".cn", ".中国", ".公司", ".网络"],
+                           "server": "dns-domestic"},
+                          {"server": "dns-foreign"}],
+                "final": "dns-domestic"},
         "inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1",
                       "listen_port": int(port)}],
         "outbounds": nodes + gout + sgout + [
@@ -576,7 +671,7 @@ def build_singbox_config(sources, port, ctl_port, secret, home, force, groups=No
         ],
         "route": {"final": "PROXY", "default_domain_resolver": "dns-bootstrap"},
         "experimental": {"clash_api": {
-            "external_controller": "127.0.0.1:%d" % int(ctl_port), "secret": secret}},
+            "external_controller": "0.0.0.0:%d" % int(ctl_port), "secret": secret}},
     }
     return cfg, meta
 
@@ -719,7 +814,7 @@ class Api:
                 msg = json.loads(e.read().decode("utf-8", "replace")).get("message")
             except Exception:
                 pass
-            raise RuntimeError(msg or ("HTTP %d" % e.code))
+            raise RuntimeError("HTTP %d: %s" % (e.code, msg or e.reason or "API 请求失败"))
         return json.loads(raw) if raw else None
 
 
@@ -1343,6 +1438,7 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         self._started = False
         self._running_kind = None
         self._port = 0
+        self._ctl_port = 0
         self._stopping = False
         self._api = None
         self._meta = {}
@@ -1406,10 +1502,8 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         try:
             with self._lock:
                 self._stop_locked(async_stop=False, force=True)
-                ports = [7890, 7891]
-                if self._port:
-                    ports.extend((self._port, self._port + 1))
-                _wait_ports_free(ports, 3, 0.05)
+                ports = [self._port] if self._port else []
+                _wait_ports_free(ports, 8, 0.1)
             self._restore_tg_proxy()
         except Exception as e:
             self.log("ProxyCore unload: %s" % e)
@@ -1484,23 +1578,18 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
 
     # --- “正在使用的节点”卡片 ---
     def _summary_texts(self, snap):
-        """返回 (标题, 标题颜色, 第二行, 第三行)。"""
+        """返回主页面运行卡片的标题及三行状态文本。"""
         kind = self._kind()
         label = CORES[kind]["label"]
         installed = os.path.exists(_core_path(kind))
         running = bool(snap and snap.get("running"))
         active = (snap or {}).get("active", "")
-        if running and active:
-            info = next((n["info"] for n in snap["nodes"] if n["name"] == active), None)
-            line2 = ("%s · %s · %s" % (info["proto"], info["net"], info["sec"])) if info \
-                else "%s · 127.0.0.1:%d" % (label, snap["port"])
-            d = self._delay.get(active)
-            now = snap.get("now", "")
-            via = "（自动选择）" if now == "AUTO" else ("（分组自动选择）" if now.startswith("G:") else "")
-            line3 = (("%d ms · " % d) if isinstance(d, int) and d > 0 else "") + "使用中" + via
-            return active, "text", line2, line3
         if running:
-            return "已连接", "text", "%s · 127.0.0.1:%d" % (label, snap["port"]), "点击打开控制面板"
+            info = next((n["info"] for n in snap["nodes"] if n["name"] == active), None)
+            protocol = ("%s · %s · %s" % (info["proto"], info["net"], info["sec"])) if info else label
+            local = "本地端口 127.0.0.1:%d" % snap["port"]
+            control = "控制端口 127.0.0.1:%d" % snap.get("ctl_port", 0)
+            return active or "已连接", "text", protocol, local + "\n" + control
         if not installed:
             return "尚未安装组件", "off", "点击打开控制面板，一键安装", "断开连接"
         return "断开连接", "off", "%s 已就绪" % label, "点击打开控制面板连接"
@@ -1518,14 +1607,14 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
                     snap = None
             title, tcolor, line2, line3 = self._summary_texts(snap)
             root = k._hbox()
-            root.setPadding(k._dp(16), k._dp(14), k._dp(16), k._dp(14))
+            root.setPadding(k._dp(16), k._dp(18), k._dp(16), k._dp(18))
             root.addView(k._icon(56, 20))
             col = k._vbox()
-            col.setPadding(k._dp(14), 0, 0, 0)
+            col.setPadding(k._dp(14), k._dp(2), 0, k._dp(2))
             col.setLayoutParams(k._lp(0, -2, weight=1))
-            col.addView(k._text(title, 17, tcolor, True, lines=2))
+            col.addView(k._text(title, 17, tcolor, True, lines=1))
             col.addView(k._text(line2, 13, "accent", lines=1))
-            col.addView(k._text(line3, 13, "sub", lines=1))
+            col.addView(k._text(line3, 13, "sub", lines=2))
             root.addView(col)
             root.addView(k._text("›", 26, "sub"))
             root.setClickable(True)
@@ -1871,9 +1960,13 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
 
                     threading.Thread(target=stop_worker, name="proxy-core-stop", daemon=True).start()
             else:
-                wait_deadline = time.time() + 3
+                # 快速关闭后，后台 Stop 可能还在释放监听；启动前必须等它真正结束，
+                # 不能在同一个原生内核上并发调用 Stop。
+                wait_deadline = time.time() + 8
                 while self._stopping and time.time() < wait_deadline:
                     time.sleep(0.05)
+                if self._stopping:
+                    raise RuntimeError("内核仍在停止，请稍后重试")
                 try:
                     stop_fn()
                 except Exception as e:
@@ -1881,6 +1974,7 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         self._started = False
         self._api = None
         self._port = 0
+        self._ctl_port = 0
 
     def _stop(self, restore_tg):
         with self._lock:
@@ -1924,15 +2018,17 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
             funcs = _load_lib(kind)  # 未安装 / 需重启会在这里抛出
             self._stop_locked(async_stop=False, force=True)  # 即使状态丢失也停止本进程中的旧内核
             start_port = int(str(self.get_setting("port", "7890")).strip() or "7890")
-            # Stop() 后等待旧监听释放，然后从设置的起始端口逐个顺延寻找连续端口。
+            # Zashboard 控制端口固定在 19090-19099 范围内，按可用端口切换。
+            ctl_port = pick_control_port()
+            # Stop() 后等待旧监听释放，然后从设置的起始端口逐个顺延寻找代理端口。
             try:
-                port, ctl_port = pick_ports(start_port)
+                port, ctl_port = pick_ports(start_port, ctl_port)
             except RuntimeError:
-                if not _wait_ports_free((start_port, start_port + 1), 3):
-                    raise RuntimeError("内核已请求停止，但从 7890 开始的端口仍被占用")
-                port, ctl_port = pick_ports(start_port)
+                if not _wait_ports_free((start_port, ctl_port), 8, 0.1):
+                    raise RuntimeError("旧内核仍未释放代理端口或控制端口 %d，请稍后重试" % ctl_port)
+                port, ctl_port = pick_ports(start_port, ctl_port)
             home = _home()
-            secret = os.urandom(8).hex()
+            secret = "123456"
             groups = self._groups_for_config(set(self._scan_node_infos()))
             scopes = {}
             for i, src in enumerate(sources):  # 已知有节点的订阅 / 单节点，才生成对应的自动选择组
@@ -1953,24 +2049,37 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
                 if any(x in lower_msg for x in ("address already in use", "eaddrinuse", "bind", "listen", "port in use")):
                     # 初始化阶段才发现旧监听未释放时，停止并在同一端口重试。
                     self._stop_locked(async_stop=False, force=True)
-                    if _wait_ports_free((port, ctl_port), 3, 0.05):
+                    if _wait_ports_free((port, ctl_port), 8, 0.1):
                         rc = funcs[0](home.encode(), cfg_path.encode())
                         msg = (funcs[2]() or b"").decode("utf-8", "replace") if rc != 0 else ""
                 if rc != 0:
                     raise RuntimeError("内核启动失败(%d): %s" % (rc, msg))
+            api = Api(ctl_port, secret, kind)
             deadline = time.time() + 6
+            proxy_ready = api_ready = False
             while time.time() < deadline:
-                try:
-                    socket.create_connection(("127.0.0.1", port), 0.5).close()
+                if not proxy_ready:
+                    try:
+                        socket.create_connection(("127.0.0.1", port), 0.5).close()
+                        proxy_ready = True
+                    except OSError:
+                        pass
+                if not api_ready:
+                    try:
+                        api.req("GET", "/version", timeout=0.8)
+                        api_ready = True
+                    except Exception:
+                        pass
+                if proxy_ready and api_ready:
                     break
-                except OSError:
-                    time.sleep(0.15)
-            else:
-                # 启动失败时后台释放，避免再次同步阻塞界面。
+                time.sleep(0.15)
+            if not (proxy_ready and api_ready):
                 threading.Thread(target=funcs[1], name="proxy-core-failed-stop", daemon=True).start()
-                raise RuntimeError("本地端口 %d 未就绪" % port)
+                reason = "控制接口 %d" % ctl_port if not api_ready else "代理端口 %d" % port
+                raise RuntimeError("内核未就绪：%s 无响应" % reason)
             self._started, self._running_kind, self._port = True, kind, port
-            self._api = Api(ctl_port, secret, kind)
+            self._ctl_port = ctl_port
+            self._api = api
             self._meta = meta
             self._save_prev_proxy()
             set_tg_proxy(True, "127.0.0.1", port)
@@ -2028,10 +2137,80 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         return [n for n in (data.get("all") or []) if n not in ("AUTO", "DIRECT", "direct")]
 
     @staticmethod
-    def _delay_one(api, name):
-        path = "/proxies/%s/delay?url=%s&timeout=15000" % (_q(name), _q(HC_URL))
+    def _provider_history(api, name):
+        """mihomo：从 proxy-providers 读取节点历史延迟（内核周期健康检查更新）。"""
+        try:
+            data = api.req("GET", "/providers/proxies", timeout=8) or {}
+        except Exception:
+            return None
+        for pid, p in (data.get("providers") or {}).items():
+            if str(pid) in ("PROXY", "GLOBAL", "COMPATIBLE"):
+                continue
+            for item in (p.get("proxies") or []):
+                if str(item.get("name", "")) != str(name):
+                    continue
+                for h in reversed(item.get("history") or []):
+                    delay = int(h.get("delay", 0) or 0)
+                    if delay > 0:
+                        return delay
+        return None
+
+    @staticmethod
+    def _group_delay(api, group, timeout_ms=5000):
+        """mihomo：一次组测速返回 {节点名: 延迟}；内核并发测试，超时节点不在结果里。"""
+        path = "/group/%s/delay?url=%s&timeout=%d" % (_q(group), _q(HC_URL), int(timeout_ms))
+        r = api.req("GET", path, timeout=timeout_ms / 1000.0 + 10)
+        if not isinstance(r, dict):
+            raise RuntimeError("组测速返回格式异常")
+        return {str(k): int(v) for k, v in r.items()
+                if isinstance(v, (int, float)) and int(v) > 0}
+
+    @staticmethod
+    def _pick_from_group(res, name):
+        if name in res:
+            return res[name]
+        folded = {_node_name_key(k): k for k in res}
+        actual = folded.get(_node_name_key(name))
+        return res[actual] if actual is not None else None
+
+    @staticmethod
+    def _delay_one(api, name, scope_group=""):
+        """单节点测速。mihomo 的订阅节点由 proxy-providers 提供，按所属组测速；
+        sing-box 的节点是直接 outbound，使用单节点 delay 接口。"""
+        name = str(name)
+        if getattr(api, "kind", "") == "mihomo":
+            groups = [g for g in (scope_group, "PROXY") if g]
+            last_err, tested = None, False
+            for g in groups:
+                try:  # 先确认节点确实在这个组里，避免用错组导致误报
+                    members = (api.req("GET", "/proxies/%s" % _q(g), timeout=5) or {}).get("all") or []
+                except Exception:
+                    members = []
+                if members and name not in members:
+                    continue
+                try:
+                    res = ProxyCorePlugin._group_delay(api, g)
+                    tested = True
+                except Exception as e:
+                    last_err = e
+                    continue
+                d = ProxyCorePlugin._pick_from_group(res, name)
+                if d is not None:
+                    return d
+                if members:  # 组测速完成但该节点没有结果 = 节点超时
+                    api.last_delay_error = "节点测速超时"
+                    return 0
+            if not tested:  # 组测速接口不可用时回退历史延迟
+                d = ProxyCorePlugin._provider_history(api, name)
+                if d:
+                    return d
+            api.last_delay_error = (("组测速失败: %s" % str(last_err)[:32]) if last_err
+                                    else "内核节点名不匹配（未找到该节点）")
+            return 0
+        # sing-box 直接 outbound：单节点测速；兼容 expected=204。
+        base = "/proxies/%s/delay?url=%s&timeout=15000" % (_q(name), _q(HC_URL))
         last_error = None
-        for attempt in range(2 if getattr(api, "kind", "") == "mihomo" else 1):
+        for path in (base + "&expected=204", base):
             try:
                 r = api.req("GET", path, timeout=18) or {}
                 delay = int(r.get("delay", 0) or 0)
@@ -2039,25 +2218,42 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
                     return delay
             except Exception as e:
                 last_error = e
-            if attempt == 0:
-                time.sleep(0.5)
-        if getattr(api, "kind", "") == "mihomo":
-            try:
-                data = api.req("GET", "/proxies/%s" % _q(name), timeout=5) or {}
-                for item in reversed(data.get("history", []) or []):
-                    delay = int(item.get("delay", 0) or 0)
-                    if delay > 0:
-                        return delay
-            except Exception as e:
-                last_error = e
+        if last_error is not None:
+            detail = str(last_error).strip()
+            if isinstance(last_error, RuntimeError) and "HTTP 404" in detail:
+                detail = "测速接口 404: Resource not found"
+            if isinstance(last_error, urllib.error.URLError):
+                cause = getattr(last_error, "reason", None)
+                if isinstance(cause, (socket.timeout, TimeoutError)):
+                    detail = "测速请求超时"
+                elif cause:
+                    detail = "网络错误: %s" % cause
+            elif isinstance(last_error, (socket.timeout, TimeoutError)):
+                detail = "测速请求超时"
+            api.last_delay_error = detail[:48] or last_error.__class__.__name__
+        else:
+            api.last_delay_error = "内核未返回有效延迟"
         return 0
 
     @staticmethod
     def _delays(api, names):
-        """通过内核 Clash API 逐节点测速；mihomo 失败时重试并读取历史延迟。"""
-        names = list(dict.fromkeys(names))
+        """批量测速。mihomo 用一次 PROXY 组测速拿全部节点延迟（内核并发完成）；
+        失败或 sing-box 再逐节点测。"""
+        names = list(dict.fromkeys(str(n) for n in names))
         if not names:
             return {}
+        if getattr(api, "kind", "") == "mihomo":
+            try:
+                res = ProxyCorePlugin._group_delay(api, "PROXY")
+            except Exception as e:
+                api.last_delay_error = str(e)[:48]
+            else:
+                out = {}
+                for n in names:
+                    d = ProxyCorePlugin._pick_from_group(res, n)
+                    out[n] = d if isinstance(d, int) and d > 0 else 0
+                api.last_delay_error = "节点测速超时"
+                return out
         with ThreadPoolExecutor(max_workers=min(4, len(names))) as ex:
             return dict((n, d) for n, d in
                         zip(names, ex.map(lambda n: ProxyCorePlugin._delay_one(api, n), names)))
@@ -2208,7 +2404,8 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         snap = {"kind": kind, "label": CORES[kind]["label"],
                 "installed": os.path.exists(_core_path(kind)),
                 "tag": str(self.get_setting("core_tag_" + kind, "") or ""),
-                "running": running, "port": self._port, "now": "", "active": "",
+                "running": running, "port": self._port, "ctl_port": self._ctl_port,
+                "now": "", "active": "",
                 "n_sources": len(self._load_sources())}
         groups = self._load_groups()
         gset = {"G:" + g["name"] for g in groups}
@@ -2264,7 +2461,8 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         if d == -2:
             return "检测中…", "sub"
         if d <= 0:
-            return "timeout", "bad"
+            reason = self._delay.get(name + "__error", "")
+            return (reason or "无测速结果"), "bad"
         return "%d ms" % d, ("ok" if d < 300 else "warn")
 
     def _apply_delay(self, name):
@@ -2293,23 +2491,27 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         row = self._hbox()
         row.addView(self._icon())
         col = self._vbox()
-        col.setPadding(self._dp(16), 0, 0, 0)
+        col.setPadding(self._dp(16), self._dp(4), self._dp(4), self._dp(4))
         col.setLayoutParams(self._lp(0, -2, weight=1))
         col.addView(self._text("已连接" if running else "断开连接", 22,
                                "text" if running else "off", True))
         if busy:
-            sub = busy
+            col.addView(self._text(busy, 13, "sub", lines=2))
         elif not snap["installed"]:
-            sub = "连接文件不随插件提供，需要下载一次"
+            col.addView(self._text("连接文件不随插件提供，需要下载一次", 13, "sub", lines=2))
         elif running:
-            sub = "%s · 127.0.0.1:%d" % (snap["label"], snap["port"])
+            info = next((n["info"] for n in snap["nodes"] if n["name"] == snap.get("active")), None)
+            proto = "%s · %s · %s" % (info["proto"], info["net"], info["sec"]) if info else snap["label"]
+            col.addView(self._text(proto, 13, "accent", lines=2))
+            col.addView(self._text("本地端口 127.0.0.1:%d" % snap["port"], 13, "sub"))
+            col.addView(self._text("控制端口 127.0.0.1:%d" % snap.get("ctl_port", 0), 13, "sub"))
+            if snap.get("active"):
+                now = snap.get("now", "")
+                via = "（自动选择）" if now == "AUTO" else ("（分组自动选择）" if now.startswith("G:") else "")
+                col.addView(self._text("使用中：" + snap["active"] + via, 13, "sub", lines=2))
         else:
             sub = "%s 已就绪%s" % (snap["label"], (" · " + snap["tag"]) if snap["tag"] else "")
-        col.addView(self._text(sub, 13, "sub"))
-        if running and not busy and snap["active"]:
-            now = snap["now"]
-            via = "（自动选择）" if now == "AUTO" else ("（分组自动选择）" if now.startswith("G:") else "")
-            col.addView(self._text("使用中：" + snap["active"] + via, 13, "accent", lines=2))
+            col.addView(self._text(sub, 13, "sub", lines=2))
         row.addView(col)
         card.addView(row)
         if busy:
@@ -2767,15 +2969,30 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
             "分组「%s」" % name[2:] if name.startswith("G:") else name)))
         self._ui_refresh()
 
+    def _scope_group_of(self, name):
+        """节点名 → 它所属的自动选择组（S:sN / S:nodes），用于单节点测速时缩小组测速范围。"""
+        src = (getattr(self, "_node_src", None) or {}).get(str(name))
+        if src is None:
+            return ""
+        sources = self._load_sources()
+        if src < len(sources) and _is_sub_url(sources[src]["value"]):
+            return "S:s%d" % src
+        return "S:nodes"
+
     def _test_delay(self, name):
         if not self._started or self._api is None:
             raise RuntimeError("请先连接")
         self._delay[name] = -2
         run_on_ui_thread(lambda: self._apply_delay(name))
         try:
-            d = self._delay_one(self._api, name)
-        except Exception:
+            d = self._delay_one(self._api, name, self._scope_group_of(name))
+        except Exception as e:
             d = 0
+            self._api.last_delay_error = str(e)[:48] or e.__class__.__name__
+        if d > 0:
+            self._delay.pop(name + "__error", None)
+        else:
+            self._delay[name + "__error"] = getattr(self._api, "last_delay_error", "内核未返回有效延迟")
         self._delay[name] = d if d > 0 else 0
         run_on_ui_thread(lambda: self._apply_delay(name))
 
@@ -2809,6 +3026,10 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         res = self._delays(api, names)
         for n in names:
             d = res.get(n)
+            if isinstance(d, int) and d > 0:
+                self._delay.pop(n + "__error", None)
+            else:
+                self._delay[n + "__error"] = getattr(api, "last_delay_error", "内核未返回有效延迟")
             self._delay[n] = d if isinstance(d, int) and d > 0 else 0
         run_on_ui_thread(mark)
 
