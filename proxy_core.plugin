@@ -2461,8 +2461,7 @@ class ProxyCorePlugin(_UiMixin, BasePlugin):
         if d == -2:
             return "检测中…", "sub"
         if d <= 0:
-            reason = self._delay.get(name + "__error", "")
-            return (reason or "无测速结果"), "bad"
+            return "timeout", "bad"
         return "%d ms" % d, ("ok" if d < 300 else "warn")
 
     def _apply_delay(self, name):
