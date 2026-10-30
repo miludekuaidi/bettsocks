@@ -1,0 +1,3563 @@
+__id__ = "proxy_core"
+__name__ = "Proxy Core"
+__description__ = "内置 mihomo / sing-box 双内核：控制面板一键安装、连接、选节点"
+__author__ = "@zizhouwangguo"
+__version__ = "3.5.1"
+__app_version__ = ">=12.0.0"
+
+import base64
+import ctypes
+import gzip
+import hashlib
+import json
+import os
+import re
+import socket
+import threading
+import traceback
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+
+from base_plugin import BasePlugin
+from android_utils import run_on_ui_thread
+from client_utils import get_last_fragment
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Input, Text, Switch, Divider
+
+try:
+    from ui.settings import Custom  # 自定义行（Custom(view=...)），部分客户端可能没有
+except Exception:
+    Custom = None
+
+try:
+    from base_plugin import MenuItemData, MenuItemType
+except Exception:  # 某些客户端没有菜单 API
+    MenuItemData = MenuItemType = None
+
+from java import jclass, jarray, jboolean, jint, dynamic_proxy, cast
+from org.telegram.messenger import ApplicationLoader
+
+SharedConfig = jclass("org.telegram.messenger.SharedConfig")
+MessagesController = jclass("org.telegram.messenger.MessagesController")
+NotificationCenter = jclass("org.telegram.messenger.NotificationCenter")
+ConnectionsManager = jclass("org.telegram.tgnet.ConnectionsManager")
+
+HC_URL = "https://www.gstatic.com/generate_204"
+CONTROL_PORT_START = 19090
+CONTROL_PORT_END = 19099
+HC_URLS = (HC_URL, "https://cp.cloudflare.com/generate_204",
+           "https://www.google.com/generate_204")
+
+# 核心从这个项目的 Releases 自动获取最新版
+CORE_REPO = "miludekuaidi/bettsocks"
+
+CORES = {
+    "mihomo": {"label": "mihomo", "file": "libmihomo.so", "prefix": "Mihomo"},
+    "singbox": {"label": "sing-box", "file": "libsingbox.so", "prefix": "Singbox"},
+}
+
+_DASH_OPEN = False
+
+# 同一进程里只能加载一种 Go 内核（两个 Go 运行时混用不稳定）
+_LIB = None
+_LIB_KIND = None
+_LIB_FUNCS = None
+
+
+class NeedRestart(Exception):
+    pass
+
+
+_OnClick = jclass("android.content.DialogInterface$OnClickListener")
+
+
+class _Click(dynamic_proxy(_OnClick)):
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def onClick(self, dialog, which):
+        try:
+            self._fn(int(which))
+        except Exception:
+            pass
+
+
+# ---------- 工具 ----------
+def _toast(msg):
+    def go():
+        try:
+            jclass("android.widget.Toast").makeText(
+                ApplicationLoader.applicationContext, str(msg), 1).show()
+        except Exception:
+            pass
+    run_on_ui_thread(go)
+
+
+def _info(msg):
+    if _DASH_OPEN:  # 控制面板盖住了提示条，改用 Toast
+        _toast(msg)
+        return
+    try:
+        run_on_ui_thread(lambda: BulletinHelper.show_info(str(msg)))
+    except Exception:
+        pass
+
+
+def _err(msg):
+    if _DASH_OPEN:
+        _toast(msg)
+        return
+    try:
+        run_on_ui_thread(lambda: BulletinHelper.show_error(str(msg)))
+    except Exception:
+        pass
+
+
+def _home():
+    ctx = ApplicationLoader.applicationContext
+    d = str(ctx.getDir("proxy_mihomo", 0).getAbsolutePath())
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _core_path(kind):
+    return os.path.join(_home(), CORES[kind]["file"])
+
+
+def _as_bool(v):
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
+def _is_sub_url(value):
+    return re.match(r"^https?://\S+$", str(value).strip(), re.I) is not None
+
+
+def _short(value):
+    value = str(value).strip()
+    if _is_sub_url(value):
+        u = urllib.parse.urlparse(value)
+        s = u.netloc + u.path
+        return s if len(s) <= 30 else s[:29] + "…"
+    toks = [x for x in re.split(r"\s+", value) if x]
+    if len(toks) == 1:
+        return "%s 节点" % toks[0].split("://", 1)[0].upper()
+    return "%d 条节点链接" % len(toks)
+
+
+def _default_name(value, index):
+    value = str(value).strip()
+    if _is_sub_url(value):
+        return urllib.parse.urlparse(value).netloc or ("订阅%d" % index)
+    return "手动节点"
+
+
+def _q(x):
+    return urllib.parse.quote(str(x), safe="")
+
+
+def _node_name_key(value):
+    """Normalize display/API node names for matching across subscription parsers."""
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = urllib.parse.unquote(text)
+    return " ".join(text.strip().split()).casefold()
+
+
+_NODE_SCHEMES = ("vmess", "vless", "trojan", "ss", "ssr", "hysteria", "hysteria2", "hy2",
+                 "tuic", "wireguard", "socks5", "anytls")
+
+
+def _is_node_link(x):
+    m = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*)://\S+$", str(x).strip())
+    return bool(m) and m.group(1).lower() in _NODE_SCHEMES
+
+
+def _node_link_name(link):
+    try:
+        return uri_to_outbound(link)["tag"]
+    except Exception:
+        pass
+    frag = urllib.parse.unquote(urllib.parse.urlparse(link).fragment)
+    return frag or link.split("://", 1)[0].upper()
+
+
+def _clipboard_text():
+    try:
+        ctx = ApplicationLoader.applicationContext
+        cm = cast(jclass("android.content.ClipboardManager"), ctx.getSystemService("clipboard"))
+        clip = cm.getPrimaryClip()
+        if clip is None or clip.getItemCount() == 0:
+            return ""
+        return str(clip.getItemAt(0).coerceToText(ctx) or "")
+    except Exception:
+        return ""
+
+
+def _set_clipboard_text(text):
+    ctx = ApplicationLoader.applicationContext
+    cm = cast(jclass("android.content.ClipboardManager"), ctx.getSystemService("clipboard"))
+    cm.setPrimaryClip(jclass("android.content.ClipData").newPlainText("Proxy Core backup", str(text)))
+
+
+def _port_free(p):
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", p))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def pick_control_port():
+    """在 Zashboard 约定的控制端口范围内选择首个可用端口。"""
+    for port in range(CONTROL_PORT_START, CONTROL_PORT_END + 1):
+        if _port_free(port):
+            return port
+    raise RuntimeError("控制端口 19090-19099 均被占用")
+
+
+def pick_ports(start=7890, ctl_port=0):
+    """代理端口顺延；控制端口使用 19090-19099 范围内的端口。"""
+    start = max(1024, int(start))
+    if not _port_free(ctl_port):
+        raise RuntimeError("控制端口 %d 被占用" % ctl_port)
+    for proxy_port in range(start, 65535):
+        if proxy_port == ctl_port:
+            continue
+        if _port_free(proxy_port):
+            return proxy_port, ctl_port
+    raise RuntimeError("从端口 %d 开始没有可用的代理端口" % start)
+
+
+def _wait_ports_free(ports, timeout=3, interval=0.1):
+    ports = [p for p in ports if 1024 <= p <= 65535]
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if all(_port_free(p) for p in ports):
+            return True
+        time.sleep(interval)
+    return not any(not _port_free(p) for p in ports)
+
+
+# ---------- mihomo 配置 ----------
+def _re_quote(s):
+    return re.sub(r"([\\.+*?()|\[\]{}^$])", r"\\\1", s)
+
+
+
+def build_mihomo_config(sources, port, ctl_port, secret, home, groups=None, scopes=None):
+    hc = {"enable": True, "url": HC_URL, "interval": 300}
+    providers, meta = {}, {}
+    for i, s in enumerate(sources):
+        pid = "s%d" % i
+        value = str(s["value"]).strip()
+        if _is_sub_url(value):
+            providers[pid] = {
+                "type": "http", "url": value,
+                "path": os.path.join(home, "%s.yaml" % pid),
+                "interval": 3600, "proxy": "DIRECT",
+                "header": {"User-Agent": ["clash.meta"]},
+                "health-check": hc,
+            }
+            meta[pid] = {"name": s["name"], "kind": "sub"}
+        else:
+            p = os.path.join(home, "%s.txt" % pid)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("\n".join(x for x in re.split(r"\s+", value) if x) + "\n")
+            providers[pid] = {"type": "file", "path": p, "health-check": hc}
+            meta[pid] = {"name": s["name"], "kind": "links"}
+    use = list(providers)
+    snames, sgroups = [], []
+    for key, pids in (scopes or {}).items():  # “只用某个订阅 / 单节点”的自动选择组
+        pids = [x for x in pids if x in providers]
+        if not pids:
+            continue
+        snames.append("S:" + key)
+        sgroups.append({"name": "S:" + key, "type": "url-test", "use": pids, "url": HC_URL,
+                        "interval": 300, "tolerance": 50})
+    gnames, ggroups = [], []
+    for g in groups or []:
+        if not g["nodes"]:
+            continue
+        filt = "^(?:" + "|".join(_re_quote(n) for n in g["nodes"]) + ")$"
+        # 启动时预建所有“分组 × 订阅”组合，切换筛选时只切换已有组。
+        variants = [("G:" + g["name"], use)]
+        for key, pids in (scopes or {}).items():
+            pids = [x for x in pids if x in providers]
+            if pids:
+                variants.append(("G:" + g["name"] + "@S:" + key, pids))
+        for gname, guse in variants:
+            ggroups.append({"name": gname, "type": "url-test", "use": guse, "filter": filt,
+                            "url": HC_URL, "interval": 300, "tolerance": 50})
+            gnames.append(gname)
+    cfg = {
+        "mixed-port": int(port),
+        "bind-address": "127.0.0.1",
+        # Zashboard 通过 Clash API 管理内核；控制接口监听所有本机网络接口。
+        "external-controller": "0.0.0.0:%d" % int(ctl_port),
+        "external-controller-cors": {
+            "allow-origins": ["*"],
+            "allow-private-network": True,
+        },
+        "secret": secret,
+        "allow-lan": False,
+        "mode": "rule",
+        "log-level": "warning",
+        "ipv6": False,
+        "find-process-mode": "off",
+        "unified-delay": True,
+        "tcp-concurrent": True,
+        "dns": {"enable": True, "ipv6": False,
+                # 使用直连 UDP DNS，避免 DoH 域名解析失败导致节点和测速都不可用。
+                "default-nameserver": ["223.5.5.5", "119.29.29.29"],
+                "nameserver": ["223.5.5.5", "119.29.29.29"],
+                "fallback": ["8.8.8.8", "1.1.1.1"],
+                "fallback-filter": {"geoip": True, "geoip-code": "CN"}},  
+        "proxy-providers": providers,
+        "proxy-groups": [
+            {"name": "PROXY", "type": "select", "proxies": ["AUTO"] + gnames + snames, "use": use},
+            {"name": "AUTO", "type": "url-test", "use": use, "url": HC_URL,
+             "interval": 300, "tolerance": 50},
+        ] + ggroups + sgroups,
+        "rules": ["MATCH,PROXY"],
+    }
+    return cfg, meta
+
+
+# ---------- sing-box：分享链接 → outbound ----------
+def _b64d(s):
+    s = s.strip().replace("-", "+").replace("_", "/")
+    return base64.b64decode(s + "=" * (-len(s) % 4))
+
+
+def _qs(u):
+    return {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+
+
+def _truthy(v):
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _qfirst(q, *names):
+    for name in names:
+        value = q.get(name)
+        if value is not None and str(value).strip() != "":
+            return value
+    return ""
+
+
+def _tls(q, host, default_on):
+    sec = q.get("security", "tls" if default_on else "none")
+    if sec not in ("tls", "reality"):
+        return None
+    t = {"enabled": True,
+         "server_name": q.get("sni") or q.get("peer") or q.get("host") or host}
+    if _truthy(q.get("allowInsecure", "")) or _truthy(q.get("insecure", "")):
+        t["insecure"] = True
+    if q.get("alpn"):
+        t["alpn"] = q["alpn"].split(",")
+    if q.get("fp") or sec == "reality":
+        t["utls"] = {"enabled": True, "fingerprint": q.get("fp") or "chrome"}
+    if sec == "reality":
+        t["reality"] = {"enabled": True, "public_key": q.get("pbk", ""),
+                        "short_id": q.get("sid", "")}
+    return t
+
+
+def _transport(net, q):
+    net = net or "tcp"
+    path = urllib.parse.unquote(q.get("path") or "/")
+    host = q.get("host") or ""
+    if net == "ws":
+        t = {"type": "ws", "path": path}
+        if host:
+            t["headers"] = {"Host": host}
+        return t
+    if net == "grpc":
+        return {"type": "grpc", "service_name": q.get("serviceName") or q.get("path") or ""}
+    if net == "httpupgrade":
+        t = {"type": "httpupgrade", "path": path}
+        if host:
+            t["host"] = host
+        return t
+    if net in ("h2", "http"):
+        t = {"type": "http", "path": path}
+        if host:
+            t["host"] = [host]
+        return t
+    if net == "tcp":
+        if q.get("headerType") == "http":
+            raise ValueError("不支持 tcp http 伪装")
+        return None
+    raise ValueError("不支持的传输: " + net)
+
+
+def _ob_vmess(uri):
+    d = json.loads(_b64d(uri[8:].split("#", 1)[0]).decode("utf-8"))
+    q = {"host": d.get("host", ""), "path": d.get("path", "/"), "sni": d.get("sni", ""),
+         "alpn": d.get("alpn", ""), "fp": d.get("fp", ""),
+         "security": "tls" if d.get("tls") == "tls" else "none",
+         "headerType": d.get("type", "none")}
+    ob = {"type": "vmess", "tag": d.get("ps") or "vmess", "server": d["add"],
+          "server_port": int(d["port"]), "uuid": d["id"],
+          "security": d.get("scy") or "auto", "alter_id": int(d.get("aid") or 0)}
+    tls = _tls(q, d["add"], False)
+    if tls:
+        ob["tls"] = tls
+    tr = _transport(d.get("net"), q)
+    if tr:
+        ob["transport"] = tr
+    return ob
+
+
+def _ob_vless(uri):
+    u = urllib.parse.urlparse(uri)
+    q = _qs(u)
+    ob = {"type": "vless", "tag": urllib.parse.unquote(u.fragment) or "vless",
+          "server": u.hostname, "server_port": u.port or 443,
+          "uuid": urllib.parse.unquote(u.username or "")}
+    if q.get("flow"):
+        ob["flow"] = q["flow"]
+    ob["packet_encoding"] = "xudp"
+    tls = _tls(q, u.hostname, False)
+    if tls:
+        ob["tls"] = tls
+    tr = _transport(q.get("type"), q)
+    if tr:
+        ob["transport"] = tr
+    return ob
+
+
+def _ob_trojan(uri):
+    u = urllib.parse.urlparse(uri)
+    q = _qs(u)
+    ob = {"type": "trojan", "tag": urllib.parse.unquote(u.fragment) or "trojan",
+          "server": u.hostname, "server_port": u.port or 443,
+          "password": urllib.parse.unquote(u.username or "")}
+    tls = _tls(q, u.hostname, True)
+    if tls:
+        ob["tls"] = tls
+    tr = _transport(q.get("type"), q)
+    if tr:
+        ob["transport"] = tr
+    return ob
+
+
+def _ob_ss(uri):
+    body, name = uri[5:], ""
+    if "#" in body:
+        body, name = body.split("#", 1)
+        name = urllib.parse.unquote(name)
+    if "?" in body:
+        body, qstr = body.split("?", 1)
+        if "plugin" in qstr:
+            raise ValueError("ss 插件暂不支持")
+    if "@" in body:
+        userinfo, hostport = body.rsplit("@", 1)
+        try:
+            dec = _b64d(userinfo).decode("utf-8")
+            if ":" not in dec:
+                raise ValueError
+        except Exception:
+            dec = urllib.parse.unquote(userinfo)
+    else:
+        dec, hostport = _b64d(body).decode("utf-8").rsplit("@", 1)
+    method, password = dec.split(":", 1)
+    host, port = hostport.rsplit(":", 1)
+    return {"type": "shadowsocks", "tag": name or "ss", "server": host.strip("[]"),
+            "server_port": int(port), "method": method, "password": password}
+
+
+def _ob_hy2(uri):
+    """Convert hysteria2:// links to sing-box's QUIC outbound format.
+
+    Hysteria2 uses HTTP/3 over QUIC.  Some providers omit alpn because
+    clients normally supply the protocol default, so make h3 explicit here.
+    Accept the parameter aliases emitted by common subscription converters.
+    """
+    u = urllib.parse.urlparse(uri)
+    q = _qs(u)
+    pw = urllib.parse.unquote(u.username or "")
+    if u.password:
+        pw += ":" + urllib.parse.unquote(u.password)
+    sni = _qfirst(q, "sni", "peer", "server_name") or u.hostname
+    insecure = any(_truthy(q.get(k, "")) for k in
+                   ("insecure", "allowInsecure", "allow_insecure"))
+    alpn = _qfirst(q, "alpn") or "h3"
+    tls = {"enabled": True, "server_name": sni,
+           "alpn": [x.strip() for x in alpn.split(",") if x.strip()] or ["h3"]}
+    if insecure:
+        tls["insecure"] = True
+    ob = {"type": "hysteria2", "tag": urllib.parse.unquote(u.fragment) or "hysteria2",
+          "server": u.hostname, "server_port": u.port or 443, "password": pw,
+          "tls": tls}
+    obfs_type = _qfirst(q, "obfs", "obfs_type")
+    if obfs_type:
+        obfs_password = _qfirst(q, "obfs-password", "obfs_password", "obfsPassword")
+        ob["obfs"] = {"type": obfs_type, "password": urllib.parse.unquote(obfs_password)}
+    for target, aliases in (
+            ("up_mbps", ("up", "upmbps", "up_mbps", "upMbps")),
+            ("down_mbps", ("down", "downmbps", "down_mbps", "downMbps")),
+            ("hop_interval", ("hop-interval", "hop_interval", "hopInterval"))):
+        value = _qfirst(q, *aliases)
+        if value:
+            if target in ("up_mbps", "down_mbps"):
+                try:
+                    ob[target] = int(str(value).lower().removesuffix("mbps"))
+                except ValueError:
+                    pass
+            else:
+                interval = str(value).strip()
+                ob[target] = interval if re.search(r"[a-zA-Z]", interval) else interval + "s"
+    ports = _qfirst(q, "mport", "ports", "port")
+    if ports:
+        port_items = []
+        for item in str(ports).split(","):
+            item = item.strip()
+            match = re.fullmatch(r"(\d+)-(\d+)", item)
+            if match:
+                item = match.group(1) + ":" + match.group(2)
+            if item:
+                port_items.append(item)
+        if port_items:
+            ob.pop("server_port", None)
+            ob["server_ports"] = port_items
+    return ob
+
+
+def _ob_tuic(uri):
+    u = urllib.parse.urlparse(uri)
+    q = _qs(u)
+    return {"type": "tuic", "tag": urllib.parse.unquote(u.fragment) or "tuic",
+            "server": u.hostname, "server_port": u.port or 443,
+            "uuid": urllib.parse.unquote(u.username or ""),
+            "password": urllib.parse.unquote(u.password or ""),
+            "congestion_control": q.get("congestion_control", "bbr"),
+            "udp_relay_mode": q.get("udp_relay_mode", "native"),
+            "tls": {"enabled": True, "server_name": q.get("sni") or u.hostname,
+                    "alpn": (q.get("alpn") or "h3").split(","),
+                    "insecure": _truthy(q.get("allow_insecure", "")) or _truthy(q.get("insecure", ""))}}
+
+
+_CONVERTERS = {"vmess": _ob_vmess, "vless": _ob_vless, "trojan": _ob_trojan,
+               "ss": _ob_ss, "hysteria2": _ob_hy2, "hy2": _ob_hy2, "tuic": _ob_tuic}
+
+
+def uri_to_outbound(uri):
+    scheme = uri.split("://", 1)[0].lower()
+    fn = _CONVERTERS.get(scheme)
+    if not fn:
+        raise ValueError("不支持的协议: " + scheme)
+    return fn(uri.strip())
+
+
+def parse_subscription_text(text):
+    t = text.strip()
+    if re.search(r"^\s*proxies\s*:", t, re.M):
+        raise ValueError("sing-box 内核暂不支持 Clash YAML 订阅，请换通用(base64)订阅或切换 mihomo")
+    if "://" not in t:
+        try:
+            t = _b64d("".join(t.split())).decode("utf-8", "replace")
+        except Exception:
+            raise ValueError("订阅内容无法解析")
+    return [x for x in re.split(r"\s+", t) if "://" in x]
+
+
+def fetch_text(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "v2rayN/7.0"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def _unique(tag, used):
+    base, n = tag, 2
+    while tag in used:
+        tag = "%s #%d" % (base, n)
+        n += 1
+    used.add(tag)
+    return tag
+
+
+def build_singbox_config(sources, port, ctl_port, secret, home, force, groups=None):
+    nodes, used, meta, pid_tags = [], {"PROXY", "AUTO", "direct"}, {}, {}
+    for i, s in enumerate(sources):
+        pid = "s%d" % i
+        value = str(s["value"]).strip()
+        is_sub = _is_sub_url(value)
+        err, uris = None, []
+        try:
+            if is_sub:
+                cache = os.path.join(home, pid + ".sub")
+                text = None
+                if force or not os.path.exists(cache):
+                    try:
+                        text = fetch_text(value)
+                        with open(cache, "w", encoding="utf-8") as f:
+                            f.write(text)
+                    except Exception as e:
+                        if not os.path.exists(cache):
+                            raise
+                        err = "下载失败，使用缓存: %s" % e
+                if text is None:
+                    with open(cache, encoding="utf-8") as f:
+                        text = f.read()
+                uris = parse_subscription_text(text)
+            else:
+                uris = [x for x in re.split(r"\s+", value) if x]
+        except Exception as e:
+            err = str(e)
+        count = 0
+        for uri in uris:
+            try:
+                ob = uri_to_outbound(uri)
+            except Exception:
+                continue
+            ob["tag"] = _unique(ob["tag"], used)
+            nodes.append(ob)
+            pid_tags.setdefault(pid, []).append(ob["tag"])
+            count += 1
+        meta[pid] = {"name": s["name"], "kind": "sub" if is_sub else "links",
+                     "count": count, "error": err}
+    tags = [n["tag"] for n in nodes]
+    if not tags:
+        raise ValueError("sing-box 没有解析出任何可用节点")
+    tag_set = set(tags)
+    scope_members = {}
+    for pid, m in meta.items():
+        if pid_tags.get(pid):
+            key = pid if m["kind"] == "sub" else "nodes"
+            scope_members.setdefault(key, []).extend(pid_tags[pid])
+    gout, gnames = [], []
+    for g in groups or []:
+        base_members = [n for n in g["nodes"] if n in tag_set]
+        if not base_members:
+            continue
+        # 启动时预建所有“分组 × 订阅”组合，切换筛选时只切换已有组。
+        variants = [("G:" + g["name"], base_members)]
+        for key, allowed_nodes in ((k, set(v)) for k, v in scope_members.items()):
+            members = [n for n in base_members if n in allowed_nodes]
+            if members:
+                variants.append(("G:" + g["name"] + "@S:" + key, members))
+        for gt, members in variants:
+            if gt in used:
+                continue
+            used.add(gt)
+            gout.append({"type": "urltest", "tag": gt, "outbounds": members, "url": HC_URL,
+                         "interval": "5m", "tolerance": 50})
+            gnames.append(gt)
+    sgout, snames = [], []
+    for key, members in scope_members.items():
+        st = "S:" + key
+        if st in used:
+            continue
+        used.add(st)
+        sgout.append({"type": "urltest", "tag": st, "outbounds": members, "url": HC_URL,
+                      "interval": "5m", "tolerance": 50})
+        snames.append(st)
+    cfg = {
+        "log": {"level": "warn"},
+        "dns": {"servers": [
+                    {"type": "https", "tag": "dns-domestic",
+                     "server": "doh.18bit.cn", "path": "/dns-query",
+                     "domain_resolver": "dns-bootstrap"},
+                    {"type": "https", "tag": "dns-domestic-2",
+                     "server": "dns.ipv4dns.com", "path": "/dns-query",
+                     "domain_resolver": "dns-bootstrap"},
+                    {"type": "https", "tag": "dns-foreign",
+                     "server": "8.8.8.8", "path": "/dns-query",
+                     "tls": {"server_name": "dns.google"},
+                     "domain_resolver": "dns-bootstrap"},
+                    {"type": "udp", "tag": "dns-bootstrap", "server": "223.5.5.5"}],
+                # 使用新版 sing-box 支持的域名后缀匹配，不再依赖已弃用的 geosite 数据库
+                "rules": [{"domain_suffix": [".cn", ".中国", ".公司", ".网络"],
+                           "server": "dns-domestic"},
+                          {"server": "dns-foreign"}],
+                "final": "dns-domestic"},
+        "inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1",
+                      "listen_port": int(port)}],
+        "outbounds": nodes + gout + sgout + [
+            {"type": "selector", "tag": "PROXY", "outbounds": ["AUTO"] + gnames + snames + tags,
+             "default": "AUTO"},
+            {"type": "urltest", "tag": "AUTO", "outbounds": tags, "url": HC_URL,
+             "interval": "5m", "tolerance": 50},
+            {"type": "direct", "tag": "direct"},
+        ],
+        "route": {"final": "PROXY", "default_domain_resolver": "dns-bootstrap"},
+        "experimental": {"clash_api": {
+            "external_controller": "0.0.0.0:%d" % int(ctl_port), "secret": secret}},
+    }
+    return cfg, meta
+
+
+# ---------- 核心自动获取与安装 ----------
+def _http_get(url, timeout=60, proxy_port=0, ua="Mozilla/5.0"):
+    """先直连；失败且本地代理在运行时，改走本地代理（HTTP）。"""
+    req = urllib.request.Request(url, headers={"User-Agent": ua, "Accept": "*/*"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read()
+    except Exception:
+        if not proxy_port:
+            raise
+        px = "http://127.0.0.1:%d" % proxy_port
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({"http": px, "https": px}))
+        with op.open(req, timeout=timeout) as r:
+            return r.read()
+
+
+def _read_sha(assets, kind, proxy_port):
+    for n in ("sha256-%s.txt" % kind, "sha256.txt"):
+        if n in assets:
+            try:
+                return _http_get(assets[n], 30, proxy_port).decode().split()[0].strip().lower()
+            except Exception:
+                return ""
+    return ""
+
+
+def resolve_core(kind, proxy_port=0):
+    """从项目 Releases 找到最新的该内核文件，返回 {tag, url, sha}。"""
+    gz = CORES[kind]["file"] + ".gz"
+    errors = []
+    try:
+        rels = json.loads(_http_get(
+            "https://api.github.com/repos/%s/releases?per_page=30" % CORE_REPO,
+            30, proxy_port).decode("utf-8"))
+        for r in rels:
+            if r.get("draft"):
+                continue
+            assets = {a["name"]: a["browser_download_url"] for a in r.get("assets", [])}
+            if gz in assets:
+                return {"tag": r.get("tag_name", ""), "url": assets[gz],
+                        "sha": _read_sha(assets, kind, proxy_port)}
+        errors.append("Releases 里没有 %s" % gz)
+    except Exception as e:
+        errors.append(str(e))
+    # API 不可用时回退到固定的 latest 地址
+    base = "https://github.com/%s/releases/latest/download/" % CORE_REPO
+    sha = ""
+    for n in ("sha256-%s.txt" % kind, "sha256.txt"):
+        try:
+            sha = _http_get(base + n, 30, proxy_port).decode().split()[0].strip().lower()
+            break
+        except Exception:
+            continue
+    if sha:
+        return {"tag": "latest", "url": base + gz, "sha": sha}
+    raise RuntimeError("获取核心信息失败: " + "; ".join(errors))
+
+
+def install_core_bytes(data, sha256, dest):
+    if data[:2] == b"\x1f\x8b":
+        data = gzip.decompress(data)
+    if len(data) < 1024 * 1024 or data[:4] != b"\x7fELF":
+        raise RuntimeError("下载内容不是有效的 .so 文件")
+    if (data[18] | (data[19] << 8)) != 183:
+        raise RuntimeError("核心不是 arm64 版本")
+    sha256 = str(sha256 or "").strip().lower()
+    if sha256 and hashlib.sha256(data).hexdigest() != sha256:
+        raise RuntimeError("SHA-256 校验失败")
+    tmp = dest + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o700)
+    os.replace(tmp, dest)
+    return len(data)
+
+
+def _load_lib(kind):
+    global _LIB, _LIB_KIND, _LIB_FUNCS
+    if _LIB is not None:
+        if _LIB_KIND != kind:
+            raise NeedRestart("同一进程里只能加载一种内核（当前已加载 %s）。"
+                              "需要重启客户端后才能使用 %s。"
+                              % (CORES[_LIB_KIND]["label"], CORES[kind]["label"]))
+        return _LIB_FUNCS
+    path = _core_path(kind)
+    if not os.path.exists(path):
+        raise RuntimeError("%s 核心未安装，请先在控制面板点击“安装组件”"
+                           % CORES[kind]["label"])
+    lib = ctypes.CDLL(path)
+    p = CORES[kind]["prefix"]
+    start, stop, last = (getattr(lib, p + "Start"), getattr(lib, p + "Stop"),
+                         getattr(lib, p + "LastError"))
+    start.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+    start.restype = ctypes.c_int
+    stop.argtypes = []
+    stop.restype = None
+    last.argtypes = []
+    last.restype = ctypes.c_char_p
+    _LIB, _LIB_KIND, _LIB_FUNCS = lib, kind, (start, stop, last)
+    return _LIB_FUNCS
+
+
+def restart_app():
+    ctx = ApplicationLoader.applicationContext
+    intent = ctx.getPackageManager().getLaunchIntentForPackage(ctx.getPackageName())
+    if intent is not None:
+        intent.addFlags(0x10000000 | 0x00008000)  # NEW_TASK | CLEAR_TASK
+        pi = jclass("android.app.PendingIntent").getActivity(ctx, 0, intent,
+                                                             0x08000000 | 0x04000000)
+        am = cast(jclass("android.app.AlarmManager"), ctx.getSystemService("alarm"))
+        am.set(0, jclass("java.lang.System").currentTimeMillis() + 800, pi)
+    Process = jclass("android.os.Process")
+    Process.killProcess(Process.myPid())
+
+
+# ---------- 控制接口（两个内核都兼容 Clash API） ----------
+class Api:
+    def __init__(self, ctl_port, secret, kind=""):
+        self.base = "http://127.0.0.1:%d" % ctl_port
+        self.secret = secret
+        self.kind = kind
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def req(self, method, path, body=None, timeout=10):
+        data = json.dumps(body).encode() if body is not None else None
+        r = urllib.request.Request(self.base + path, data=data, method=method, headers={
+            "Authorization": "Bearer " + self.secret, "Content-Type": "application/json"})
+        try:
+            with self.opener.open(r, timeout=timeout) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as e:
+            msg = None
+            try:
+                msg = json.loads(e.read().decode("utf-8", "replace")).get("message")
+            except Exception:
+                pass
+            raise RuntimeError("HTTP %d: %s" % (e.code, msg or e.reason or "API 请求失败"))
+        return json.loads(raw) if raw else None
+
+
+# ---------- 对话框（和控制面板同一套圆角卡片风格） ----------
+def _kit():
+    act = None
+    try:
+        act = get_last_fragment().getParentActivity()
+    except Exception:
+        act = None
+    if act is None:
+        act = ApplicationLoader.applicationContext
+    density = float(act.getResources().getDisplayMetrics().density)
+    try:
+        dark = bool(jclass("org.telegram.ui.ActionBar.Theme").isCurrentThemeDark())
+    except Exception:
+        dark = False
+    return _Kit(act, density, _PAL_DARK if dark else _PAL_LIGHT)
+
+
+def _show_card_dialog(title, message=None, body=None, buttons=(), scroll=True, header=None):
+    """body: 函数(kit, dlg) -> View；buttons: [(文字, 样式, 回调, 字号)]，回调返回 False 时对话框保持打开。"""
+    def show():
+        try:
+            k = _kit()
+            act = k._act
+            dm = act.getResources().getDisplayMetrics()
+            sw, sh = int(dm.widthPixels), int(dm.heightPixels)
+            width = int(sw * 0.9)
+            inner = width - 2 * k._dp(22)
+            dlg = jclass("android.app.Dialog")(act)
+            dlg.requestWindowFeature(1)
+            card = k._vbox()
+            card.setPadding(k._dp(22), k._dp(22), k._dp(22), k._dp(16))
+            card.setBackground(k._shape("card", 28, "stroke"))
+            card.addView(k._text(title, 20, "text", True))
+
+            def capped(view, cap):
+                MS = jclass("android.view.View$MeasureSpec")
+                view.measure(MS.makeMeasureSpec(inner, 1073741824), MS.makeMeasureSpec(0, 0))
+                h = int(view.getMeasuredHeight())
+                sc = jclass("android.widget.ScrollView")(act)
+                sc.addView(view)
+                sc.setLayoutParams(k._lp(-1, min(h, cap), m=(0, 10, 0, 4)))
+                return sc
+
+            if message:
+                card.addView(capped(k._text(message, 14, "sub"), int(sh * 0.45)))
+            if header is not None:  # 固定在列表上方、不随列表滚动的区域（例如搜索框）
+                hv = header(k, dlg)
+                hv.setLayoutParams(k._lp(-1, -2, m=(0, 10, 0, 2)))
+                card.addView(hv)
+            if body is not None:
+                view = body(k, dlg)
+                if scroll:
+                    card.addView(capped(view, int(sh * 0.5)))
+                else:
+                    view.setLayoutParams(k._lp(-1, -2, m=(0, 10, 0, 4)))
+                    card.addView(view)
+
+            def wrap(fn):
+                def click():
+                    keep = False
+                    try:
+                        keep = fn() is False
+                    except Exception as e:
+                        _toast(str(e))
+                    if not keep:
+                        dlg.dismiss()
+                return click
+            row = k._hbox()
+            row.setLayoutParams(k._lp(-1, -2, m=(0, 12, 0, 0)))
+            for btn in buttons:
+                text, style, fn = btn[0], btn[1], btn[2]
+                sp = btn[3] if len(btn) > 3 else 15
+                row.addView(k._button(text, style, wrap(fn), h=44, weight=1, m=(4, 0, 4, 0), sp=sp))
+            card.addView(row)
+            dlg.setContentView(card)
+            win = dlg.getWindow()
+            win.setBackgroundDrawable(jclass("android.graphics.drawable.ColorDrawable")(0))
+            win.setLayout(width, -2)
+            win.setSoftInputMode(20)
+            dlg.show()
+        except Exception as e:
+            _toast("无法显示对话框: %s" % e)
+    run_on_ui_thread(show)
+
+
+def list_dialog(title, labels, on_pick, buttons=None):
+    def body(k, dlg):
+        box = k._vbox()
+        for i, label in enumerate(labels):
+            tv = k._text(label, 16, "text", lines=3)
+            tv.setPadding(k._dp(16), k._dp(14), k._dp(16), k._dp(14))
+            tv.setBackground(k._shape("icon", 16))
+            tv.setLayoutParams(k._lp(-1, -2, m=(0, 4, 0, 4)))
+            tv.setClickable(True)
+            tv.setOnClickListener(_VClick(
+                (lambda idx: (lambda: (dlg.dismiss(), on_pick(idx))))(i)))
+            box.addView(tv)
+        return box
+    _show_card_dialog(title, body=body, buttons=buttons or [("取消", "outline", lambda: None)])
+
+
+def message_dialog(title, message, pos_text=None, on_pos=None):
+    buttons = [("关闭", "outline", lambda: None)]
+    if pos_text:
+        buttons.append((pos_text, "primary", lambda: on_pos()))
+    _show_card_dialog(title, message=message, buttons=buttons)
+
+
+def multi_dialog(title, labels, checked, on_ok, searchable=False):
+    """勾选对话框。searchable=True 时顶部有关键词筛选框（空格分隔多个关键词，需同时包含）；
+    “全选/清空”只作用于当前显示的行，不会关闭对话框。"""
+    state, rows, holder = list(checked), [], {"kw": ""}
+
+    def visible(i):
+        # 空格 = 同时包含；竖线 | = 或者。例如“香港 iplc|日本”
+        low = labels[i].lower()
+        alts = [a.split() for a in holder["kw"].lower().split("|")]
+        alts = [a for a in alts if a]
+        return not alts or any(all(w in low for w in a) for a in alts)
+
+    def status():
+        tv = holder.get("status")
+        if tv is not None:
+            vis = sum(1 for i in range(len(labels)) if visible(i))
+            tv.setText("已选 %d / 共 %d · 当前显示 %d" % (sum(1 for x in state if x), len(labels), vis))
+
+    def paint(i):
+        k, tv = holder["k"], rows[i]
+        tv.setText(("☑  " if state[i] else "☐  ") + labels[i])
+        tv.setBackground(k._shape("icon", 14) if state[i] else k._shape("card", 14, "stroke"))
+
+    def on_text(t):
+        holder["kw"] = t.strip()
+        for i, tv in enumerate(rows):
+            tv.setVisibility(0 if visible(i) else 8)
+        status()
+
+    def header(k, dlg):
+        box = k._vbox()
+        e = jclass("android.widget.EditText")(k._act)
+        e.setHint("输入关键词筛选：空格=同时包含，|=或者")
+        e.setTextSize(15.0)
+        e.setTextColor(k._c("text"))
+        e.setHintTextColor(k._c("sub"))
+        e.setBackground(k._shape("card", 14, "stroke"))
+        e.setPadding(k._dp(14), k._dp(10), k._dp(14), k._dp(10))
+        e.setSingleLine(True)
+        e.addTextChangedListener(_Watch(on_text))
+        box.addView(e)
+        st = k._text("", 12, "sub")
+        st.setPadding(k._dp(4), k._dp(6), k._dp(4), 0)
+        holder["status"] = st
+        box.addView(st)
+        box.addView(k._text("“全选/清空”只作用于当前显示的节点", 11, "sub"))
+        return box
+
+    def body(k, dlg):
+        holder["k"] = k
+        box = k._vbox()
+        for i in range(len(labels)):
+            tv = k._text("", 15, "text", lines=2)
+            tv.setPadding(k._dp(14), k._dp(12), k._dp(14), k._dp(12))
+            tv.setLayoutParams(k._lp(-1, -2, m=(0, 3, 0, 3)))
+            tv.setClickable(True)
+            rows.append(tv)
+
+            def toggle(idx=i):
+                state[idx] = not state[idx]
+                paint(idx)
+                status()
+            tv.setOnClickListener(_VClick(toggle))
+            box.addView(tv)
+            paint(i)
+        status()
+        return box
+
+    def toggle_all():
+        vis = [i for i in range(len(state)) if visible(i)]
+        if not vis:
+            return False
+        val = not all(state[i] for i in vis)
+        for i in vis:
+            state[i] = val
+            paint(i)
+        status()
+        return False
+    _show_card_dialog(title, body=body, header=header if searchable else None, buttons=[
+        ("取消", "outline", lambda: None, 14),
+        ("全选/清空", "outline", toggle_all, 14),
+        ("保存", "primary", lambda: on_ok(list(state)), 14)])
+
+
+def input_dialog(title, hints, values, on_ok, lines=None):
+    """输入对话框；on_ok 返回 False 时保持打开（用于校验失败）。"""
+    edits = []
+
+    def body(k, dlg):
+        box = k._vbox()
+        for n, (hint, val) in enumerate(zip(hints, values)):
+            e = jclass("android.widget.EditText")(k._act)
+            e.setHint(hint)
+            e.setText(val)
+            e.setTextSize(15.0)
+            e.setTextColor(k._c("text"))
+            e.setHintTextColor(k._c("sub"))
+            e.setBackground(k._shape("card", 14, "stroke"))
+            e.setPadding(k._dp(14), k._dp(12), k._dp(14), k._dp(12))
+            nl = (lines or [1] * len(hints))[n]
+            if nl > 1:
+                e.setMinLines(nl)
+                e.setGravity(48)
+            else:
+                e.setSingleLine(True)
+            e.setLayoutParams(k._lp(-1, -2, m=(0, 6, 0, 6)))
+            edits.append(e)
+            box.addView(e)
+        return box
+    _show_card_dialog(title, body=body, scroll=False, buttons=[
+        ("取消", "outline", lambda: None),
+        ("确定", "primary", lambda: on_ok([str(e.getText().toString()) for e in edits]))])
+
+
+# ---------- Telegram 代理设置 ----------
+def set_tg_proxy(enabled, host="", port=0, user="", pw="", secret=""):
+    def work():
+        try:
+            if enabled and host:
+                info = SharedConfig.ProxyInfo(host, port, user, pw, secret)
+                SharedConfig.addProxy(info)
+                SharedConfig.currentProxy = info
+            ed = MessagesController.getGlobalMainSettings().edit()
+            ed.putBoolean("proxy_enabled", bool(enabled))
+            if host:
+                ed.putString("proxy_ip", host)
+                ed.putInt("proxy_port", int(port))
+                ed.putString("proxy_user", user)
+                ed.putString("proxy_pass", pw)
+                ed.putString("proxy_secret", secret)
+            ed.apply()
+            ConnectionsManager.setProxySettings(bool(enabled), host, int(port), user, pw, secret)
+            NotificationCenter.getGlobalInstance().postNotificationName(
+                NotificationCenter.proxySettingsChanged)
+        except Exception as e:
+            _err("设置 Telegram 代理失败: %s" % e)
+    run_on_ui_thread(work)
+
+
+def read_tg_proxy():
+    sp = MessagesController.getGlobalMainSettings()
+    return {"e": bool(sp.getBoolean("proxy_enabled", False)),
+            "ip": str(sp.getString("proxy_ip", "") or ""),
+            "port": int(sp.getInt("proxy_port", 1080)),
+            "u": str(sp.getString("proxy_user", "") or ""),
+            "p": str(sp.getString("proxy_pass", "") or ""),
+            "s": str(sp.getString("proxy_secret", "") or "")}
+
+
+# ---------- 节点信息（协议 · 传输 · 加密），用于控制面板展示 ----------
+_PROTO_NAMES = {"shadowsocks": "SS", "ss": "SS", "hysteria2": "hy2", "hy2": "hy2"}
+
+
+def _ob_info(ob):
+    proto = ob.get("type", "")
+    tls = ob.get("tls")
+    net = (ob.get("transport") or {}).get("type") or (
+        "udp" if proto in ("hysteria2", "tuic") else "tcp")
+    sec = "reality" if tls and tls.get("reality") else ("tls" if tls else "none")
+    return {"proto": _PROTO_NAMES.get(proto, proto.upper()), "net": net, "sec": sec}
+
+
+def _unq(v):
+    v = str(v).strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+        v = v[1:-1]
+    return v
+
+
+def _split_flow(text):
+    parts, depth, quote, cur = [], 0, None, ""
+    for ch in text:
+        if quote:
+            cur += ch
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+            cur += ch
+        elif ch in "{[":
+            depth += 1
+            cur += ch
+        elif ch in "}]":
+            depth -= 1
+            cur += ch
+        elif ch == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    parts.append(cur)
+    return parts
+
+
+def _clash_info(d):
+    t = str(d.get("type", "")).lower()
+    udp = t in ("hysteria", "hysteria2", "tuic")
+    if "reality-opts" in d:
+        sec = "reality"
+    elif str(d.get("tls", "")).lower() == "true" or t in ("trojan", "hysteria", "hysteria2", "tuic"):
+        sec = "tls"
+    else:
+        sec = "none"
+    return {"proto": _PROTO_NAMES.get(t, t.upper()),
+            "net": d.get("network") or ("udp" if udp else "tcp"), "sec": sec}
+
+
+def _clash_infos(text):
+    """很简化的 Clash YAML 扫描：只取 proxies 段里每个节点的 name/type/network/tls。"""
+    out, cur, cur_indent, in_proxies = [], None, 0, False
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        st = line.strip()
+        if not st or st.startswith("#"):
+            continue
+        if re.match(r"^proxies\s*:", line):
+            in_proxies = True
+            continue
+        if not in_proxies:
+            continue
+        if re.match(r"^[A-Za-z][\w-]*\s*:", line):  # 下一个顶层字段，proxies 段结束
+            break
+        m = re.match(r"^\s*-\s*\{(.*)\}\s*$", line)
+        if m:
+            d = {}
+            for part in _split_flow(m.group(1)):
+                if ":" in part:
+                    k, v = part.split(":", 1)
+                    d[k.strip()] = _unq(v)
+            if d.get("name"):
+                out.append((d["name"], _clash_info(d)))
+            cur = None
+            continue
+        m = re.match(r"^(\s*)-\s+([\w-]+)\s*:\s*(.*)$", line)
+        if m:
+            cur = {m.group(2): _unq(m.group(3))}
+            cur_indent = len(m.group(1)) + 2
+            out.append(cur)
+            continue
+        if cur is not None:
+            m = re.match(r"^(\s+)([\w-]+)\s*:\s*(.*)$", line)
+            if m and len(m.group(1)) == cur_indent:
+                cur[m.group(2)] = _unq(m.group(3))
+    result = []
+    for x in out:
+        if isinstance(x, tuple):
+            result.append(x)
+        elif x.get("name"):
+            result.append((x["name"], _clash_info(x)))
+    return result
+
+
+def node_infos_from_text(text):
+    if re.search(r"^\s*proxies\s*:", text, re.M):
+        return _clash_infos(text)
+    out = []
+    try:
+        uris = parse_subscription_text(text)
+    except Exception:
+        uris = []
+    for u in uris:
+        try:
+            ob = uri_to_outbound(u)
+            out.append((ob["tag"], _ob_info(ob)))
+        except Exception:
+            continue
+    return out
+
+
+# ---------- 控制面板用到的 Android 视图工具 ----------
+_PAL_LIGHT = {"bg": "#F0F1F3", "card": "#FFFFFF", "stroke": "#DADADA", "text": "#202124",
+              "sub": "#7A7F85", "blue": "#4A98E8", "icon": "#EAF2F8", "accent": "#4F8FCB",
+              "outline": "#BFD6EA", "ok": "#2E9B5F", "warn": "#E0902B", "bad": "#D9534F",
+              "off": "#8A9099"}
+_PAL_DARK = {"bg": "#121212", "card": "#1E1F22", "stroke": "#3A3B3E", "text": "#E8EAED",
+             "sub": "#9AA0A6", "blue": "#4A98E8", "icon": "#263340", "accent": "#7FB2E5",
+             "outline": "#3F5B78", "ok": "#5DC98A", "warn": "#F0AE55", "bad": "#EE7B72",
+             "off": "#9AA0A6"}
+
+_ViewClickIface = jclass("android.view.View$OnClickListener")
+_DismissIface = jclass("android.content.DialogInterface$OnDismissListener")
+_RunnableIface = jclass("java.lang.Runnable")
+
+
+class _VClick(dynamic_proxy(_ViewClickIface)):
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def onClick(self, v):
+        try:
+            self._fn()
+        except Exception:
+            pass
+
+
+class _Dismiss(dynamic_proxy(_DismissIface)):
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def onDismiss(self, d):
+        try:
+            self._fn()
+        except Exception:
+            pass
+
+
+class _Run(dynamic_proxy(_RunnableIface)):
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def run(self):
+        try:
+            self._fn()
+        except Exception:
+            pass
+
+
+_CheckIface = jclass("android.widget.CompoundButton$OnCheckedChangeListener")
+
+
+class _Check(dynamic_proxy(_CheckIface)):
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def onCheckedChanged(self, button, checked):
+        try:
+            self._fn(bool(checked))
+        except Exception:
+            pass
+
+
+_WatchIface = jclass("android.text.TextWatcher")
+
+
+class _Watch(dynamic_proxy(_WatchIface)):
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def beforeTextChanged(self, s, start, count, after):
+        pass
+
+    def onTextChanged(self, s, start, before, count):
+        pass
+
+    def afterTextChanged(self, s):
+        try:
+            self._fn(str(s.toString()))
+        except Exception:
+            pass
+
+
+# ---------- 视图工具（控制面板和对话框共用） ----------
+class _UiMixin:
+    """依赖 self._act / self._density / self._pal。"""
+
+    def _dp(self, v):
+        return int(v * self._density + 0.5)
+
+    def _c(self, key):
+        return jclass("android.graphics.Color").parseColor(self._pal[key])
+
+    def _shape(self, fill, radius, stroke=None, oval=False, sw=1):
+        gd = jclass("android.graphics.drawable.GradientDrawable")()
+        if oval:
+            gd.setShape(1)
+        else:
+            gd.setCornerRadius(float(self._dp(radius)))
+        gd.setColor(self._c(fill))
+        if stroke:
+            gd.setStroke(self._dp(sw), self._c(stroke))
+        return gd
+
+    def _lp(self, w, h, weight=None, m=(0, 0, 0, 0)):
+        LP = jclass("android.widget.LinearLayout$LayoutParams")
+        lp = LP(w, h, float(weight)) if weight is not None else LP(w, h)
+        lp.setMargins(*[self._dp(x) for x in m])
+        return lp
+
+    def _text(self, text, sp, color, bold=False, lines=0):
+        tv = jclass("android.widget.TextView")(self._act)
+        tv.setText(str(text))
+        tv.setTextSize(float(sp))
+        tv.setTextColor(self._c(color))
+        if bold:
+            tv.setTypeface(jclass("android.graphics.Typeface").DEFAULT_BOLD)
+        if lines:
+            tv.setMaxLines(lines)
+            tv.setEllipsize(jclass("android.text.TextUtils$TruncateAt").END)
+        return tv
+
+    def _vbox(self):
+        b = jclass("android.widget.LinearLayout")(self._act)
+        b.setOrientation(1)
+        return b
+
+    def _hbox(self, gravity=16):
+        b = jclass("android.widget.LinearLayout")(self._act)
+        b.setOrientation(0)
+        b.setGravity(gravity)
+        return b
+
+    def _card(self, selected=False, on_click=None, compact=False, pad=20):
+        c = self._vbox()
+        d = self._dp(14 if compact else pad)
+        c.setPadding(d, d, d, d)
+        c.setBackground(self._shape("card", 22 if compact else 28, "blue" if selected else "stroke",
+                                    sw=2 if selected else 1))
+        if compact:  # 双列：两张卡片各占一半
+            c.setLayoutParams(self._lp(0, -2, weight=1, m=(6, 6, 6, 6)))
+        else:
+            c.setLayoutParams(self._lp(-1, -2, m=(12, 6, 12, 6)))
+        if on_click:
+            c.setClickable(True)
+            c.setOnClickListener(_VClick(on_click))
+        return c
+
+    def _icon(self, size=64, sp=22):
+        ic = jclass("android.widget.TextView")(self._act)
+        ic.setText("▶\uFE0E")
+        ic.setTextSize(float(sp))
+        ic.setTextColor(self._c("accent"))
+        ic.setGravity(17)
+        ic.setBackground(self._shape("icon", 0, oval=True))
+        ic.setLayoutParams(self._lp(self._dp(size), self._dp(size)))
+        return ic
+
+    def _small_button(self, text, fn):
+        """放在卡片末尾的小按钮。"""
+        b = jclass("android.widget.TextView")(self._act)
+        b.setText(str(text))
+        b.setTextSize(12.0)
+        b.setGravity(17)
+        b.setTypeface(jclass("android.graphics.Typeface").DEFAULT_BOLD)
+        b.setPadding(self._dp(14), 0, self._dp(14), 0)
+        b.setBackground(self._shape("card", 17, "outline", sw=1))
+        b.setTextColor(self._c("accent"))
+        b.setClickable(True)
+        b.setOnClickListener(_VClick(fn))
+        b.setLayoutParams(self._lp(-2, self._dp(34), m=(8, 0, 0, 0)))
+        return b
+
+    def _button(self, text, style, fn, h=52, weight=None, m=(0, 16, 0, 0), sp=16):
+        b = jclass("android.widget.TextView")(self._act)
+        b.setText(str(text))
+        b.setGravity(17)
+        b.setTextSize(float(sp))
+        b.setTypeface(jclass("android.graphics.Typeface").DEFAULT_BOLD)
+        r = h // 2
+        if style == "primary":
+            b.setBackground(self._shape("blue", r))
+            b.setTextColor(jclass("android.graphics.Color").WHITE)
+        elif style == "gray":
+            b.setBackground(self._shape("off", r))
+            b.setTextColor(jclass("android.graphics.Color").WHITE)
+        else:
+            b.setBackground(self._shape("card", r, "outline", sw=2))
+            b.setTextColor(self._c("accent"))
+        b.setClickable(True)
+        b.setOnClickListener(_VClick(fn))
+        b.setLayoutParams(self._lp(-1 if weight is None else 0, self._dp(h), weight=weight, m=m))
+        return b
+
+    def _chip(self, text, selected, fn):
+        tv = jclass("android.widget.TextView")(self._act)
+        tv.setText(str(text))
+        tv.setTextSize(14.0)
+        tv.setGravity(17)
+        tv.setTypeface(jclass("android.graphics.Typeface").DEFAULT_BOLD)
+        tv.setPadding(self._dp(16), 0, self._dp(16), 0)
+        if selected:
+            tv.setBackground(self._shape("blue", 18))
+            tv.setTextColor(jclass("android.graphics.Color").WHITE)
+        else:
+            tv.setBackground(self._shape("card", 18, "outline", sw=1))
+            tv.setTextColor(self._c("accent"))
+        tv.setClickable(True)
+        tv.setOnClickListener(_VClick(fn))
+        tv.setLayoutParams(self._lp(-2, self._dp(36), m=(4, 0, 4, 0)))
+        return tv
+
+    def _badge(self, text):
+        """卡片标题旁的小徽标，例如“使用中”。"""
+        b = jclass("android.widget.TextView")(self._act)
+        b.setText(str(text))
+        b.setTextSize(11.0)
+        b.setGravity(17)
+        b.setTypeface(jclass("android.graphics.Typeface").DEFAULT_BOLD)
+        b.setTextColor(jclass("android.graphics.Color").WHITE)
+        b.setPadding(self._dp(8), self._dp(2), self._dp(8), self._dp(2))
+        b.setBackground(self._shape("blue", 10))
+        b.setLayoutParams(self._lp(-2, -2, m=(8, 0, 0, 0)))
+        return b
+
+
+class _Kit(_UiMixin):
+    def __init__(self, act, density, pal):
+        self._act, self._density, self._pal = act, density, pal
+
+
+# ---------- 插件 ----------
+class ProxyCorePlugin(_UiMixin, BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+        self._started = False
+        self._running_kind = None
+        self._port = 0
+        self._ctl_port = 0
+        self._stopping = False
+        self._api = None
+        self._meta = {}
+        self._menu_ids = []
+        # 控制面板
+        self._dlg = None
+        self._content = None
+        self._scroll = None
+        self._act = None
+        self._density = 3.0
+        self._pal = _PAL_LIGHT
+        self._busy = ""
+        self._snap = None
+        self._delay = {}
+        self._delay_views = {}
+        self._info_cache = {}
+        self._keep = []
+        self._poll_token = None
+        self._last_reload = 0.0
+        self._src_counts = {}
+        self._node_src = {}
+        self._auto_delay_token = object()
+        self._auto_delay_busy = False
+        self._dashboard_page = "home"
+        self._stats_tab = "usage"
+        self._stats_limit = 20
+        self._stats_lock = threading.RLock()
+        self._stats_stop = threading.Event()
+
+    # --- 生命周期 ---
+    def on_plugin_load(self):
+        self._stats_stop.clear()
+        threading.Thread(target=self._stats_cleanup_loop, name="proxy-core-stats-cleanup", daemon=True).start()
+        self._register_menu()
+        if _as_bool(self.get_setting("enabled", False)):
+            self._run_async(self._auto_start, quiet=True)
+        threading.Thread(target=self._auto_delay_loop, name="proxy-core-delay", daemon=True).start()
+
+    def _auto_start(self):
+        """应用快速重开时，等待旧内核释放后自动重试。"""
+        for attempt in range(1, 9):
+            if not _as_bool(self.get_setting("enabled", False)):
+                return
+            try:
+                self._start()
+                return
+            except NeedRestart:
+                raise
+            except Exception as e:
+                text = str(e).lower()
+                busy = any(x in text for x in (
+                    "端口", "port", "address already in use", "eaddrinuse",
+                    "bind", "listen", "仍在断开"))
+                if not busy or attempt == 8:
+                    raise
+                self.log("自动启动等待旧内核释放（%d/8）: %s" % (attempt, e))
+                time.sleep(1)
+
+    def on_plugin_unload(self):
+        self._stats_stop.set()
+        for i in list(self._menu_ids):
+            try:
+                self.remove_menu_item(i)
+            except Exception:
+                pass
+        self._menu_ids = []
+        try:
+            if self._dlg is not None:
+                run_on_ui_thread(lambda: self._dlg.dismiss())
+        except Exception:
+            pass
+        try:
+            with self._lock:
+                self._stop_locked(async_stop=False, force=True)
+                ports = [self._port] if self._port else []
+                _wait_ports_free(ports, 8, 0.1)
+            self._restore_tg_proxy()
+        except Exception as e:
+            self.log("ProxyCore unload: %s" % e)
+
+    def _register_menu(self):
+        if MenuItemData is None or MenuItemType is None:
+            return
+        for item_id, text, fn in (
+                ("proxy_core_panel", "代理控制面板", self._open_dashboard),
+                ("proxy_core_stop", "停止代理内核", self._manual_stop)):
+            try:
+                self.remove_menu_item(item_id)
+            except Exception:
+                pass
+            try:
+                self.add_menu_item(MenuItemData(
+                    menu_type=MenuItemType.DRAWER_MENU, text=text,
+                    on_click=(lambda f: (lambda *_: self._run_async(f)))(fn),
+                    item_id=item_id, icon="msg_language", priority=1))
+                self._menu_ids.append(item_id)
+            except Exception as e:
+                self.log("ProxyCore menu: %s" % e)
+
+    # --- 当前内核 ---
+    def _kind(self):
+        k = str(self.get_setting("core_type", "mihomo"))
+        return k if k in CORES else "mihomo"
+
+    # --- 设置页 ---
+    # ---------- 设置页 ----------
+    def _set(self, key, value, reload=False):
+        try:
+            self.set_setting(key, value, reload_settings=reload)
+        except TypeError:
+            self.set_setting(key, value)
+
+    def _reload_settings(self, force=False):
+        """让设置页重建，刷新“正在使用的节点”卡片（带节流，避免反复重建）。"""
+        now = time.time()
+        if not force and now - self._last_reload < 2.0:
+            return
+        self._last_reload = now
+        try:
+            self._set("ui_tick", str(int(now)), reload=True)
+        except Exception as e:
+            self.log("reload settings: %s" % e)
+
+    @staticmethod
+    def _mk(cls, **kw):
+        """不同客户端的设置项参数可能不同：不认识 subtext / icon 时去掉再试。"""
+        try:
+            return cls(**kw)
+        except TypeError:
+            kw.pop("subtext", None)
+            kw.pop("icon", None)
+            return cls(**kw)
+
+    def create_settings(self):
+        items = []
+        card = self._settings_card_item()
+        if card is not None:
+            items += [card, Divider()]
+        else:  # 客户端不支持自定义行时的退路
+            items += [Header(text="控制面板"),
+                      Text(text="打开控制面板（安装 / 连接 / 选节点）", icon="msg_settings",
+                           accent=True, on_click=lambda *_: self._open_dashboard())]
+        items.append(Text(text="停止内核（恢复原有代理设置）", icon="msg_pause", accent=True,
+                          on_click=lambda *_: self._run_async(self._manual_stop)))
+        items.append(Text(text="测试当前节点延迟", icon="msg_timer", accent=True,
+                          on_click=lambda *_: self._run_bg(self._test_active)))
+        items.append(Text(text="节点统计", icon="msg_stats", accent=True,
+                          on_click=lambda *_: self._run_bg(self._open_switch_stats_page)))
+        items.append(Header(text="配置"))
+        items.append(Text(text="备份配置到剪贴板", icon="msg_copy", accent=True,
+                          on_click=lambda *_: self._backup_settings()))
+        items.append(Text(text="从剪贴板恢复配置", icon="msg_retry", accent=True,
+                          on_click=lambda *_: self._restore_settings_from_clipboard()))
+        items.append(Header(text="运行"))
+        items += self._settings_run_items()
+        return items
+
+    def _backup_settings(self):
+        data = {
+            "format": "proxy_core_backup",
+            "version": 1,
+            "settings": {
+                "core_type": self._kind(),
+                "port": str(self.get_setting("port", "7890")),
+                "cols": str(self.get_setting("cols", "1")),
+                "enabled": _as_bool(self.get_setting("enabled", False)),
+                "sources": self._load_sources(),
+                "groups": self._load_groups(),
+                "cur_src": str(self.get_setting("cur_src", "") or ""),
+                "cur_group": str(self.get_setting("cur_group", "") or ""),
+                "last_pick": str(self.get_setting("last_pick", "") or ""),
+            },
+        }
+        try:
+            _set_clipboard_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+            _toast("配置已备份到剪贴板")
+        except Exception as e:
+            _err("备份失败: %s" % e)
+
+    def _restore_settings_from_clipboard(self):
+        raw = _clipboard_text().strip()
+        try:
+            data = json.loads(raw)
+            if data.get("format") != "proxy_core_backup":
+                raise ValueError("不是 Proxy Core 备份内容")
+            s = data.get("settings") or {}
+            sources = s.get("sources")
+            groups = s.get("groups")
+            if not isinstance(sources, list) or not isinstance(groups, list):
+                raise ValueError("备份内容不完整")
+            clean_sources = []
+            for item in sources:
+                if not isinstance(item, dict) or not str(item.get("value", "")).strip():
+                    raise ValueError("订阅或节点配置格式错误")
+                clean_sources.append({"name": str(item.get("name", "")),
+                                     "value": str(item["value"]).strip()})
+            clean_groups = []
+            for item in groups:
+                if not isinstance(item, dict) or not str(item.get("name", "")).strip():
+                    raise ValueError("分组配置格式错误")
+                clean_groups.append({"name": str(item["name"]).strip(),
+                                     "nodes": [str(x) for x in (item.get("nodes") or [])]})
+        except Exception as e:
+            _err("恢复失败: %s" % e)
+            return
+
+        self._set("core_type", str(s.get("core_type", "mihomo"))
+                   if str(s.get("core_type", "mihomo")) in CORES else "mihomo")
+        self._set("port", str(s.get("port", "7890")))
+        self._set("cols", "2" if str(s.get("cols", "1")) == "2" else "1")
+        self._set("enabled", bool(s.get("enabled", False)))
+        self._save_sources(clean_sources)
+        self._save_groups(clean_groups)
+        self._set("cur_src", str(s.get("cur_src", "") or ""))
+        self._set("cur_group", str(s.get("cur_group", "") or ""))
+        self._set("last_pick", str(s.get("last_pick", "") or ""))
+        self._info_cache = {}
+        if self._started:
+            self._busy_run("正在应用恢复配置…", self._start)
+        else:
+            _info("配置已恢复，请打开控制面板连接")
+            self._reload_settings(force=True)
+
+    # --- “正在使用的节点”卡片 ---
+    def _summary_texts(self, snap):
+        """返回主页面运行卡片的标题及三行状态文本。"""
+        kind = self._kind()
+        label = CORES[kind]["label"]
+        installed = os.path.exists(_core_path(kind))
+        running = bool(snap and snap.get("running"))
+        active = (snap or {}).get("active", "")
+        if running:
+            info = next((n["info"] for n in snap["nodes"] if n["name"] == active), None)
+            protocol = ("%s · %s · %s" % (info["proto"], info["net"], info["sec"])) if info else label
+            local = "本地端口 127.0.0.1:%d" % snap["port"]
+            control = "控制端口 127.0.0.1:%d" % snap.get("ctl_port", 0)
+            return active or "已连接", "text", protocol, local + "\n" + control
+        if not installed:
+            return "尚未安装组件", "off", "点击打开控制面板，一键安装", "断开连接"
+        return "断开连接", "off", "%s 已就绪" % label, "点击打开控制面板连接"
+
+    def _settings_card_item(self):
+        if Custom is None:
+            return None
+        try:
+            k = _kit()
+            snap = self._snap
+            if snap is None:
+                try:
+                    snap = self._collect()
+                except Exception:
+                    snap = None
+            title, tcolor, line2, line3 = self._summary_texts(snap)
+            root = k._hbox()
+            root.setPadding(k._dp(16), k._dp(18), k._dp(16), k._dp(18))
+            root.addView(k._icon(56, 20))
+            col = k._vbox()
+            col.setPadding(k._dp(14), k._dp(2), 0, k._dp(2))
+            col.setLayoutParams(k._lp(0, -2, weight=1))
+            col.addView(k._text(title, 17, tcolor, True, lines=1))
+            col.addView(k._text(line2, 13, "accent", lines=1))
+            col.addView(k._text(line3, 13, "sub", lines=2))
+            root.addView(col)
+            root.addView(k._text("›", 26, "sub"))
+            root.setClickable(True)
+            root.setOnClickListener(_VClick(lambda: self._open_dashboard()))
+            root.setLayoutParams(jclass("android.view.ViewGroup$LayoutParams")(-1, -2))
+            return Custom(view=root)
+        except Exception as e:
+            self.log("settings card: %s" % e)
+            return None
+
+    # --- “运行”下的两项 ---
+    @staticmethod
+    def _setting_row(k, title, sub, right):
+        row = k._hbox()
+        row.setPadding(k._dp(16), k._dp(12), k._dp(16), k._dp(12))
+        col = k._vbox()
+        col.setLayoutParams(k._lp(0, -2, weight=1))
+        col.addView(k._text(title, 16, "text"))
+        col.addView(k._text(sub, 12, "sub", lines=2))
+        row.addView(col)
+        row.addView(right)
+        row.setLayoutParams(jclass("android.view.ViewGroup$LayoutParams")(-1, -2))
+        return row
+
+    def _settings_run_items(self):
+        port = str(self.get_setting("port", "7890"))
+        auto = _as_bool(self.get_setting("enabled", False))
+        delay_interval = str(self.get_setting("delay_interval", "0") or "0")
+        if Custom is not None:
+            try:
+                k = _kit()
+                pill = k._small_button(port, lambda: self._edit_port())
+                delay_pill = k._small_button(delay_interval + " 分钟", lambda: self._edit_delay_interval())
+                sw = jclass("android.widget.Switch")(k._act)
+                sw.setChecked(bool(auto))
+                sw.setOnCheckedChangeListener(_Check(self._on_auto))
+                return [
+                    Custom(view=self._setting_row(k, "本地端口", "从 7890 开始被占用时自动顺延 +1", pill)),
+                    Custom(view=self._setting_row(k, "自动连接", "随客户端启动时自动连接（记住上次状态）", sw)),
+                    Custom(view=self._setting_row(k, "自动延迟测试", "每隔指定分钟测试当前使用节点，0 表示关闭", delay_pill)),
+                ]
+            except Exception as e:
+                self.log("settings rows: %s" % e)
+        return [
+            self._mk(Input, key="port", text="本地端口", subtext="从 7890 开始被占用时自动顺延 +1",
+                     icon="msg_language", default=port,
+                     on_change=lambda v: self.set_setting("port", v)),
+            self._mk(Switch, key="enabled", text="自动连接",
+                     subtext="随客户端启动时自动连接（记住上次状态）", icon="msg_retry",
+                     default=bool(auto),
+                     on_change=lambda v: self.set_setting("enabled", bool(v))),
+            self._mk(Input, key="delay_interval", text="自动延迟测试（分钟）",
+                     subtext="测试当前使用节点，0 表示关闭", icon="msg_timer",
+                     default=delay_interval,
+                     on_change=lambda v: self.set_setting("delay_interval", v)),
+        ]
+
+    def _edit_delay_interval(self):
+        def ok(vals):
+            v = vals[0].strip()
+            if not v.isdigit() or int(v) > 1440:
+                _toast("间隔需为 0–1440 分钟")
+                return False
+            self._set("delay_interval", str(int(v)), reload=True)
+            _toast("自动延迟测试间隔已保存")
+        input_dialog("自动延迟测试间隔", ["分钟（0 表示关闭）"],
+                     [str(self.get_setting("delay_interval", "0"))], ok)
+
+    def _auto_delay_loop(self):
+        while self._auto_delay_token is not None:
+            try:
+                mins = int(str(self.get_setting("delay_interval", "0") or "0"))
+            except Exception:
+                mins = 0
+            if mins <= 0:
+                time.sleep(10)
+                continue
+            time.sleep(max(10, mins * 60))
+            if not self._started or self._api is None or self._busy or self._auto_delay_busy:
+                continue
+            try:
+                snap = self._collect()
+                name = str(snap.get("active", "") or "")
+                if name and name not in ("AUTO", "direct"):
+                    self._auto_delay_busy = True
+                    self._run_bg(lambda n=name: self._test_delay(n))
+            except Exception as e:
+                self.log("auto delay: %s" % e)
+            finally:
+                self._auto_delay_busy = False
+
+    def _on_auto(self, value):
+        self._set("enabled", bool(value), reload=False)
+
+    def _edit_port(self):
+        def ok(vals):
+            v = vals[0].strip()
+            if not v.isdigit() or not (1024 <= int(v) <= 65000):
+                _toast("端口需为 1024–65000 的数字")
+                return False
+            self._set("port", v, reload=True)  # 重建设置页，让按钮显示新端口
+            _toast("端口已保存，重新连接后生效")
+        input_dialog("本地端口", ["端口（1024–65000）"],
+                     [str(self.get_setting("port", "7890"))], ok)
+
+    # --- 订阅数据 ---
+    def _load_sources(self):
+        try:
+            raw = json.loads(self.get_setting("sources", "[]") or "[]")
+        except Exception:
+            raw = []
+        out = []
+        for x in raw if isinstance(raw, list) else []:
+            if isinstance(x, dict) and str(x.get("value", "")).strip():
+                out.append({"name": str(x.get("name", "")), "value": str(x["value"]).strip()})
+        if not out:  # 迁移旧版输入框
+            old = str(self.get_setting("nodes", "") or "").strip()
+            if old:
+                items = [x for x in re.split(r"[\s|]+", old) if x]
+                links = [x for x in items if not _is_sub_url(x)]
+                for u in [x for x in items if _is_sub_url(x)]:
+                    out.append({"name": _default_name(u, len(out) + 1), "value": u})
+                if links:
+                    out.append({"name": "手动节点", "value": "\n".join(links)})
+                self._save_sources(out)
+                self.set_setting("nodes", "")
+        return out
+
+    def _save_sources(self, sources):
+        self.set_setting("sources", json.dumps(sources, ensure_ascii=False))
+
+    # --- 订阅管理界面 ---
+    def _manage(self):
+        def build():
+            srcs = self._load_sources()
+            labels = ["＋ 添加订阅"]
+            labels += ["%s  ·  %s" % (s["name"] or "未命名", _short(s["value"])) for s in srcs]
+
+            def pick(i):
+                if i == 0:
+                    self._edit_source(None)
+                else:
+                    self._source_menu(i - 1)
+
+            buttons = [("更新订阅", "primary", lambda: self._busy_run("正在更新订阅…", self._refresh))]
+            if srcs:
+                buttons.append(("清空全部", "outline", lambda: self._save_and_apply([], "已清空所有订阅", quiet=True)))
+            buttons.append(("关闭", "outline", lambda: None))
+            list_dialog("订阅管理 (%d)" % len(srcs), labels, pick, buttons=buttons)
+        threading.Thread(target=build, daemon=True).start()
+
+    def _source_menu(self, idx):
+        srcs = self._load_sources()
+        if idx >= len(srcs):
+            return
+        src = srcs[idx]
+        items = []
+        if _is_sub_url(src["value"]):
+            items += [("更新此订阅", "upd"), ("只看此订阅的节点", "view")]
+        items += [("编辑", "edit"), ("删除", "del")]
+
+        def pick(i):
+            act = items[i][1]
+            if act == "upd":
+                self._busy_run("正在更新订阅…", lambda: self._update_source(idx))
+            elif act == "view":
+                self._run_bg(lambda: self._use_src("s%d" % idx))
+            elif act == "edit":
+                self._edit_source(idx)
+            else:
+                cur = self._load_sources()
+                if idx < len(cur):
+                    removed = cur.pop(idx)
+                    self._save_and_apply(cur, "已删除: " + (removed["name"] or "订阅"), quiet=True)
+        list_dialog(src["name"] or "订阅", [t for t, _ in items], pick)
+
+    def _edit_source(self, idx):
+        srcs = self._load_sources()
+        cur = srcs[idx] if idx is not None and idx < len(srcs) else {"name": "", "value": ""}
+
+        def ok(vals):
+            name, value = vals[0].strip(), vals[1].strip()
+            if not value:
+                _toast("订阅地址或节点链接不能为空")
+                return False
+            lst = self._load_sources()
+            item = {"name": name or _default_name(value, len(lst) + 1), "value": value}
+            if idx is not None and idx < len(lst):
+                lst[idx] = item
+                at = idx
+            else:
+                lst.append(item)
+                at = len(lst) - 1
+            self._save_and_apply(lst, "已保存: " + item["name"], fetch_idx=at)
+        input_dialog("编辑订阅" if idx is not None else "添加订阅",
+                     ["名称（可选）", "订阅地址 或 节点链接（可多条，空格/换行分隔）"],
+                     [cur["name"], cur["value"]], ok, lines=[1, 4])
+
+    def _import_nodes(self):
+        """导入单个（或几个）节点分享链接；每个节点是一个独立条目，可单独编辑 / 删除。"""
+        clip = _clipboard_text().strip()
+        pre = clip if any(_is_node_link(t) for t in re.split(r"\s+", clip) if t) else ""
+
+        def ok(vals):
+            name = vals[0].strip()
+            toks = [t for t in re.split(r"\s+", vals[1].strip()) if t]
+            if not toks:
+                _toast("请粘贴节点链接")
+                return False
+            if any(_is_sub_url(t) for t in toks):
+                _toast("这是订阅地址，请用“添加订阅”")
+                return False
+            bad = [t for t in toks if not _is_node_link(t)]
+            if bad:
+                _toast("无法识别的链接：" + bad[0][:30])
+                return False
+            lst = self._load_sources()
+            for t in toks:
+                lst.append({"name": name if (name and len(toks) == 1) else _node_link_name(t),
+                            "value": t})
+            self._save_and_apply(lst, "已导入 %d 个节点" % len(toks), quiet=True)
+        input_dialog("导入单个节点",
+                     ["名称（可选）", "节点链接（vmess:// vless:// trojan:// ss:// hysteria2:// tuic://）"],
+                     ["", pre], ok, lines=[1, 3])
+
+    def _update_source(self, idx):
+        """只更新某一个订阅，不动其它订阅。"""
+        srcs = self._load_sources()
+        if idx >= len(srcs):
+            raise RuntimeError("订阅不存在")
+        src = srcs[idx]
+        if not _is_sub_url(src["value"]):
+            raise RuntimeError("这是单个节点，不需要更新")
+        name = src["name"] or "订阅"
+        kind, pid = self._kind(), "s%d" % idx
+        pp = self._port if self._started else 0
+        if kind == "mihomo" and self._started and self._api is not None:
+            # 内核在运行：让内核只刷新这一个 provider
+            self._api.req("PUT", "/providers/proxies/" + _q(pid), timeout=60)
+            data = self._api.req("GET", "/providers/proxies/" + _q(pid)) or {}
+            count = len(data.get("proxies") or [])
+        else:
+            ua = "clash.meta" if kind == "mihomo" else "v2rayN/7.0"
+            text = _http_get(src["value"], 30, pp, ua).decode("utf-8", "replace")
+            if kind == "singbox":
+                uris = parse_subscription_text(text)  # 不支持的格式（如 Clash YAML）会在这里报错
+                count = 0
+                for u in uris:
+                    try:
+                        uri_to_outbound(u)
+                        count += 1
+                    except Exception:
+                        continue
+            else:
+                count = len(node_infos_from_text(text))
+            if not count:
+                raise RuntimeError("订阅「%s」内容无法解析或为空，已保留旧数据" % name)
+            path = os.path.join(_home(), "%s.%s" % (pid, "yaml" if kind == "mihomo" else "sub"))
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            if kind == "singbox" and self._started:
+                self._start()  # sing-box 的节点写在配置里，运行中需要重启才生效
+        _info("订阅「%s」已更新：%d 个节点" % (name, count))
+        self._ui_refresh()
+
+    def _save_and_apply(self, sources, tip, quiet=False, fetch_idx=None):
+        def go():
+            self._save_sources(sources)
+            self._set("cur_src", "")  # 订阅序号可能变化，清掉“只看某个订阅”
+            if str(self.get_setting("last_pick", "") or "").startswith("S:"):
+                self._set("last_pick", "AUTO")
+            _info(tip)
+            try:
+                if sources and self._started:
+                    if quiet:
+                        self._start()
+                    else:
+                        self._refresh()
+                elif not sources and self._started:
+                    self._stop(restore_tg=True)
+                elif (sources and fetch_idx is not None and fetch_idx < len(sources)
+                      and _is_sub_url(sources[fetch_idx]["value"])):
+                    self._update_source(fetch_idx)  # 没连接时也先把订阅下载下来，节点列表才有内容
+            except Exception as e:
+                _err(str(e))
+            self._ui_refresh()
+        threading.Thread(target=go, name="proxy-core", daemon=True).start()
+
+    # --- 通用 ---
+    def _run_async(self, fn, quiet=False):
+        def go():
+            try:
+                fn()
+            except NeedRestart as e:
+                self._ask_restart(str(e))
+            except Exception as e:
+                self.log("ProxyCore: %s" % e)
+                _err(("内核启动失败: %s" % e) if quiet else str(e))
+        threading.Thread(target=go, name="proxy-core", daemon=True).start()
+
+    def _ask_restart(self, text):
+        message_dialog("需要重启客户端", text, "立即重启客户端", restart_app)
+
+    # --- 内核切换与安装 ---
+    def _choose_core(self):
+        cur = self._kind()
+        keys = list(CORES)
+        labels = [CORES[k]["label"] + ("  ✔" if k == cur else "") +
+                  ("" if os.path.exists(_core_path(k)) else "（未安装）") for k in keys]
+        labels.append("更新当前内核")
+
+        def pick(i):
+            if i == len(keys):
+                self._busy_run("正在更新核心…", lambda: self._install_or_update(cur))
+                return
+            new = keys[i]
+            if new == cur:
+                return
+
+            def go():
+                try:
+                    self._stop(restore_tg=True)  # 先停掉旧内核，避免两个内核同时占用
+                    self.set_setting("core_type", new)
+                    # 设置保存后立即刷新控制面板，使“内核”按钮显示新内核。
+                    self._ui_refresh()
+                    if _LIB is not None and _LIB_KIND != new:
+                        self._ask_restart("已切换到 %s。同一进程里只能加载一种内核，"
+                                          "请重启客户端后再点“启动内核”。" % CORES[new]["label"])
+                    else:
+                        _info("已切换到 %s，请确认已安装核心后点“启动内核”" % CORES[new]["label"])
+                except NeedRestart as e:
+                    self._ask_restart(str(e))
+            threading.Thread(target=go, daemon=True).start()
+        list_dialog("选择内核", labels, pick)
+
+    def _install_or_update(self, kind, force=False):
+        """从项目 Releases 获取最新核心并安装；已是最新则跳过。"""
+        label = CORES[kind]["label"]
+        pp = self._port if self._started else 0
+        _info("正在查询最新的 %s 核心…" % label)
+        rel = resolve_core(kind, pp)
+        dest = _core_path(kind)
+        cur = str(self.get_setting("core_tag_" + kind, "") or "")
+        if (not force and os.path.exists(dest) and cur and rel["tag"] != "latest"
+                and cur == rel["tag"]):
+            _info("%s 核心已是最新版本（%s）" % (label, cur))
+            return
+        _info("正在下载 %s 核心（%s）…" % (label, rel["tag"]))
+        data = _http_get(rel["url"], 300, pp)
+        n = install_core_bytes(data, rel["sha"], dest)
+        self.set_setting("core_tag_" + kind, rel["tag"])
+        loaded = _LIB is not None and _LIB_KIND == kind
+        _info("%s 核心安装完成 %.1f MB（%s）" % (label, n / 1048576.0, rel["tag"]))
+        if loaded:
+            raise NeedRestart("%s 核心已更新，但旧版本仍在运行中，重启客户端后才会使用新版本。" % label)
+
+    # --- 启停 ---
+    def _manual_start(self):
+        self.set_setting("enabled", True)
+        self._start()
+        _info("%s 已启动 127.0.0.1:%d" % (CORES[self._running_kind]["label"], self._port))
+
+    def _manual_stop(self):
+        was = self._started
+        self._stop(restore_tg=True)
+        self.set_setting("enabled", False)
+        _info("内核已停止，Telegram 代理设置已恢复" if was else "内核当前没有运行")
+
+    def _stop_locked(self, async_stop=True, force=False):
+        if _LIB_FUNCS is not None and (self._started or force):
+            stop_fn = _LIB_FUNCS[1]
+            if async_stop:
+                # 用户主动断开时不等待原生 Stop，避免面板长时间卡在“正在断开”。
+                if not self._stopping:
+                    self._stopping = True
+
+                    def stop_worker():
+                        try:
+                            stop_fn()
+                        except Exception as e:
+                            self.log("ProxyCore stop: %s" % e)
+                        finally:
+                            self._stopping = False
+
+                    threading.Thread(target=stop_worker, name="proxy-core-stop", daemon=True).start()
+            else:
+                # 快速关闭后，后台 Stop 可能还在释放监听；启动前必须等它真正结束，
+                # 不能在同一个原生内核上并发调用 Stop。
+                wait_deadline = time.time() + 8
+                while self._stopping and time.time() < wait_deadline:
+                    time.sleep(0.05)
+                if self._stopping:
+                    raise RuntimeError("内核仍在停止，请稍后重试")
+                try:
+                    stop_fn()
+                except Exception as e:
+                    self.log("ProxyCore stop: %s" % e)
+        self._started = False
+        self._api = None
+        self._port = 0
+        self._ctl_port = 0
+
+    def _stop(self, restore_tg):
+        with self._lock:
+            self._stop_locked()
+        if restore_tg:
+            self._restore_tg_proxy()
+        self._ui_refresh()
+
+    def _save_prev_proxy(self):
+        if self.get_setting("prev_proxy", ""):
+            return
+        try:
+            prev = read_tg_proxy()
+            if prev["e"] and prev["ip"] == "127.0.0.1":
+                prev["e"] = False  # 上次异常退出残留的本插件代理，不当作原设置
+            self.set_setting("prev_proxy", json.dumps(prev))
+        except Exception as e:
+            self.log("save prev proxy: %s" % e)
+
+    def _restore_tg_proxy(self):
+        raw = self.get_setting("prev_proxy", "")
+        prev = None
+        try:
+            prev = json.loads(raw) if raw else None
+        except Exception:
+            prev = None
+        if prev:
+            set_tg_proxy(prev["e"], prev["ip"], prev["port"], prev["u"], prev["p"], prev["s"])
+            self.set_setting("prev_proxy", "")
+        else:
+            set_tg_proxy(False)
+
+    def _start(self, force=False):
+        with self._lock:
+            if self._stopping:
+                raise RuntimeError("内核仍在断开，请稍后再连接")
+            kind = self._kind()
+            sources = self._load_sources()
+            if not sources:
+                raise RuntimeError("还没有添加订阅或节点，请先在“订阅管理”里添加")
+            funcs = _load_lib(kind)  # 未安装 / 需重启会在这里抛出
+            self._stop_locked(async_stop=False, force=True)  # 即使状态丢失也停止本进程中的旧内核
+            start_port = int(str(self.get_setting("port", "7890")).strip() or "7890")
+            # Zashboard 控制端口固定在 19090-19099 范围内，按可用端口切换。
+            ctl_port = pick_control_port()
+            # Stop() 后等待旧监听释放，然后从设置的起始端口逐个顺延寻找代理端口。
+            try:
+                port, ctl_port = pick_ports(start_port, ctl_port)
+            except RuntimeError:
+                if not _wait_ports_free((start_port, ctl_port), 8, 0.1):
+                    raise RuntimeError("旧内核仍未释放代理端口或控制端口 %d，请稍后重试" % ctl_port)
+                port, ctl_port = pick_ports(start_port, ctl_port)
+            home = _home()
+            secret = "123456"
+            groups = self._groups_for_config(set(self._scan_node_infos()))
+            scopes = {}
+            for i, src in enumerate(sources):  # 已知有节点的订阅 / 单节点，才生成对应的自动选择组
+                if self._src_counts.get(i):
+                    key = ("s%d" % i) if _is_sub_url(src["value"]) else "nodes"
+                    scopes.setdefault(key, []).append("s%d" % i)
+            if kind == "mihomo":
+                cfg, meta = build_mihomo_config(sources, port, ctl_port, secret, home, groups, scopes)
+            else:
+                cfg, meta = build_singbox_config(sources, port, ctl_port, secret, home, force, groups)
+            cfg_path = os.path.join(home, "config_%s.json" % kind)
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False)
+            rc = funcs[0](home.encode(), cfg_path.encode())
+            if rc != 0:
+                msg = (funcs[2]() or b"").decode("utf-8", "replace")
+                lower_msg = msg.lower()
+                if any(x in lower_msg for x in ("address already in use", "eaddrinuse", "bind", "listen", "port in use")):
+                    # 初始化阶段才发现旧监听未释放时，停止并在同一端口重试。
+                    self._stop_locked(async_stop=False, force=True)
+                    if _wait_ports_free((port, ctl_port), 8, 0.1):
+                        rc = funcs[0](home.encode(), cfg_path.encode())
+                        msg = (funcs[2]() or b"").decode("utf-8", "replace") if rc != 0 else ""
+                if rc != 0:
+                    raise RuntimeError("内核启动失败(%d): %s" % (rc, msg))
+            api = Api(ctl_port, secret, kind)
+            deadline = time.time() + 6
+            proxy_ready = api_ready = False
+            while time.time() < deadline:
+                if not proxy_ready:
+                    try:
+                        socket.create_connection(("127.0.0.1", port), 0.5).close()
+                        proxy_ready = True
+                    except OSError:
+                        pass
+                if not api_ready:
+                    try:
+                        api.req("GET", "/version", timeout=0.8)
+                        api_ready = True
+                    except Exception:
+                        pass
+                if proxy_ready and api_ready:
+                    break
+                time.sleep(0.15)
+            if not (proxy_ready and api_ready):
+                threading.Thread(target=funcs[1], name="proxy-core-failed-stop", daemon=True).start()
+                reason = "控制接口 %d" % ctl_port if not api_ready else "代理端口 %d" % port
+                raise RuntimeError("内核未就绪：%s 无响应" % reason)
+            self._started, self._running_kind, self._port = True, kind, port
+            self._ctl_port = ctl_port
+            self._api = api
+            self._meta = meta
+            self._save_prev_proxy()
+            set_tg_proxy(True, "127.0.0.1", port)
+            self._delay = {}
+            self._restore_pick()
+            if port != 7890:
+                _info("端口 7890 被占用，已顺延使用端口 %d（控制端口 %d）" % (port, ctl_port))
+        self._ui_refresh()
+
+    def _ensure_running(self):
+        if not self._started or self._api is None:
+            self._start()
+        return self._api
+
+    # --- 订阅更新与节点选择 ---
+    def _refresh(self):
+        kind = self._kind()
+        self._start(force=True)  # sing-box 会重新下载订阅；mihomo 在下面强制更新
+        api = self._api
+        lines, total = [], 0
+        for pid, m in self._meta.items():
+            name = m["name"] or pid
+            error, count = m.get("error"), m.get("count")
+            if kind == "mihomo":
+                error = None
+                if m["kind"] == "sub":
+                    try:
+                        api.req("PUT", "/providers/proxies/" + _q(pid), timeout=60)
+                    except Exception as e:
+                        error = str(e)
+                try:
+                    data = api.req("GET", "/providers/proxies/" + _q(pid)) or {}
+                    count = len(data.get("proxies") or [])
+                except Exception as e:
+                    count = 0
+                    error = error or str(e)
+            total += count or 0
+            if count:
+                lines.append("✔ %s：%d 个节点%s" % (name, count, ("（%s）" % error) if error else ""))
+            else:
+                lines.append("✘ %s：0 个节点%s" % (name, ("，" + error) if error else "，订阅内容无法解析或为空"))
+        text = "\n".join(lines) + "\n\n共 %d 个节点" % total
+        self._ui_refresh()
+        if total:
+            if _DASH_OPEN:  # 面板已经打开，节点列表会自动刷新
+                message_dialog("订阅更新结果", text)
+            else:
+                message_dialog("订阅更新结果", text, "打开控制面板", self._open_dashboard)
+        else:
+            message_dialog("订阅更新结果", text)
+
+    @staticmethod
+    def _node_names(api):
+        data = api.req("GET", "/proxies/PROXY") or {}
+        return [n for n in (data.get("all") or []) if n not in ("AUTO", "DIRECT", "direct")]
+
+    @staticmethod
+    def _provider_history(api, name):
+        """mihomo：从 proxy-providers 读取节点历史延迟（内核周期健康检查更新）。"""
+        try:
+            data = api.req("GET", "/providers/proxies", timeout=8) or {}
+        except Exception:
+            return None
+        for pid, p in (data.get("providers") or {}).items():
+            if str(pid) in ("PROXY", "GLOBAL", "COMPATIBLE"):
+                continue
+            for item in (p.get("proxies") or []):
+                if str(item.get("name", "")) != str(name):
+                    continue
+                for h in reversed(item.get("history") or []):
+                    delay = int(h.get("delay", 0) or 0)
+                    if delay > 0:
+                        return delay
+        return None
+
+    @staticmethod
+    def _group_delay(api, group, timeout_ms=5000):
+        """mihomo：一次组测速返回 {节点名: 延迟}；内核并发测试，超时节点不在结果里。"""
+        path = "/group/%s/delay?url=%s&timeout=%d" % (_q(group), _q(HC_URL), int(timeout_ms))
+        r = api.req("GET", path, timeout=timeout_ms / 1000.0 + 10)
+        if not isinstance(r, dict):
+            raise RuntimeError("组测速返回格式异常")
+        return {str(k): int(v) for k, v in r.items()
+                if isinstance(v, (int, float)) and int(v) > 0}
+
+    @staticmethod
+    def _pick_from_group(res, name):
+        if name in res:
+            return res[name]
+        folded = {_node_name_key(k): k for k in res}
+        actual = folded.get(_node_name_key(name))
+        return res[actual] if actual is not None else None
+
+    @staticmethod
+    def _delay_one(api, name, scope_group=""):
+        """单节点测速。mihomo 的订阅节点由 proxy-providers 提供，按所属组测速；
+        sing-box 的节点是直接 outbound，使用单节点 delay 接口。"""
+        name = str(name)
+        if getattr(api, "kind", "") == "mihomo":
+            groups = [g for g in (scope_group, "PROXY") if g]
+            last_err, tested = None, False
+            for g in groups:
+                try:  # 先确认节点确实在这个组里，避免用错组导致误报
+                    members = (api.req("GET", "/proxies/%s" % _q(g), timeout=5) or {}).get("all") or []
+                except Exception:
+                    members = []
+                if members and name not in members:
+                    continue
+                try:
+                    res = ProxyCorePlugin._group_delay(api, g)
+                    tested = True
+                except Exception as e:
+                    last_err = e
+                    continue
+                d = ProxyCorePlugin._pick_from_group(res, name)
+                if d is not None:
+                    return d
+                if members:  # 组测速完成但该节点没有结果 = 节点超时
+                    api.last_delay_error = "节点测速超时"
+                    return 0
+            if not tested:  # 组测速接口不可用时回退历史延迟
+                d = ProxyCorePlugin._provider_history(api, name)
+                if d:
+                    return d
+            api.last_delay_error = (("组测速失败: %s" % str(last_err)[:32]) if last_err
+                                    else "内核节点名不匹配（未找到该节点）")
+            return 0
+        # sing-box 直接 outbound：单节点测速；兼容 expected=204。
+        base = "/proxies/%s/delay?url=%s&timeout=15000" % (_q(name), _q(HC_URL))
+        last_error = None
+        for path in (base + "&expected=204", base):
+            try:
+                r = api.req("GET", path, timeout=18) or {}
+                delay = int(r.get("delay", 0) or 0)
+                if delay > 0:
+                    return delay
+            except Exception as e:
+                last_error = e
+        if last_error is not None:
+            detail = str(last_error).strip()
+            if isinstance(last_error, RuntimeError) and "HTTP 404" in detail:
+                detail = "测速接口 404: Resource not found"
+            if isinstance(last_error, urllib.error.URLError):
+                cause = getattr(last_error, "reason", None)
+                if isinstance(cause, (socket.timeout, TimeoutError)):
+                    detail = "测速请求超时"
+                elif cause:
+                    detail = "网络错误: %s" % cause
+            elif isinstance(last_error, (socket.timeout, TimeoutError)):
+                detail = "测速请求超时"
+            api.last_delay_error = detail[:48] or last_error.__class__.__name__
+        else:
+            api.last_delay_error = "内核未返回有效延迟"
+        return 0
+
+    @staticmethod
+    def _delays(api, names):
+        """批量测速。mihomo 用一次 PROXY 组测速拿全部节点延迟（内核并发完成）；
+        失败或 sing-box 再逐节点测。"""
+        names = list(dict.fromkeys(str(n) for n in names))
+        if not names:
+            return {}
+        if getattr(api, "kind", "") == "mihomo":
+            try:
+                res = ProxyCorePlugin._group_delay(api, "PROXY")
+            except Exception as e:
+                api.last_delay_error = str(e)[:48]
+            else:
+                out = {}
+                for n in names:
+                    d = ProxyCorePlugin._pick_from_group(res, n)
+                    out[n] = d if isinstance(d, int) and d > 0 else 0
+                api.last_delay_error = "节点测速超时"
+                return out
+        with ThreadPoolExecutor(max_workers=min(4, len(names))) as ex:
+            return dict((n, d) for n, d in
+                        zip(names, ex.map(lambda n: ProxyCorePlugin._delay_one(api, n), names)))
+
+    # --- 打开 / 刷新 ---
+    def _open_dashboard(self):
+        def build():
+            global _DASH_OPEN
+            try:
+                if self._dlg is not None:
+                    try:
+                        self._dlg.dismiss()
+                    except Exception:
+                        pass
+                act = get_last_fragment().getParentActivity()
+                self._act = act
+                self._density = float(act.getResources().getDisplayMetrics().density)
+                try:
+                    dark = bool(jclass("org.telegram.ui.ActionBar.Theme").isCurrentThemeDark())
+                except Exception:
+                    dark = False
+                self._pal = _PAL_DARK if dark else _PAL_LIGHT
+                dlg = jclass("android.app.Dialog")(
+                    act, jclass("android.R$style").Theme_DeviceDefault_NoActionBar)
+                root = self._vbox()
+                root.setBackgroundColor(self._c("bg"))
+                try:
+                    top = int(jclass("org.telegram.messenger.AndroidUtilities").statusBarHeight)
+                except Exception:
+                    top = self._dp(28)
+                root.setPadding(0, top, 0, 0)
+                bar = self._hbox()
+                bar.setPadding(self._dp(20), self._dp(12), self._dp(20), self._dp(8))
+                title = self._text("节点统计" if self._dashboard_page == "stats" else "Proxy Core", 22, "text", True)
+                title.setLayoutParams(self._lp(0, -2, weight=1))
+                close = self._text("关闭", 16, "accent", True)
+                close.setPadding(self._dp(8), self._dp(8), self._dp(8), self._dp(8))
+                close.setClickable(True)
+                close.setOnClickListener(_VClick(lambda: dlg.dismiss()))
+                bar.addView(title)
+                if self._dashboard_page == "stats":
+                    back = self._text("返回", 16, "accent", True)
+                    back.setPadding(self._dp(8), self._dp(8), self._dp(8), self._dp(8))
+                    back.setClickable(True)
+                    back.setOnClickListener(_VClick(lambda: dlg.dismiss()))
+                    bar.addView(back)
+                bar.addView(close)
+                scroll = jclass("android.widget.ScrollView")(act)
+                content = self._vbox()
+                content.setPadding(0, 0, 0, self._dp(40))
+                scroll.addView(content)
+                root.addView(bar)
+                root.addView(scroll, self._lp(-1, 0, weight=1))
+                dlg.setContentView(root)
+                win = dlg.getWindow()
+                win.setBackgroundDrawable(
+                    jclass("android.graphics.drawable.ColorDrawable")(self._c("bg")))
+                win.setLayout(-1, -1)
+                dismiss = _Dismiss(self._on_dismiss)
+                self._keep = [dismiss]
+                dlg.setOnDismissListener(dismiss)
+                self._dlg, self._content, self._scroll = dlg, content, scroll
+                _DASH_OPEN = True
+                dlg.show()
+                self._ui_refresh()
+                tok = object()
+                self._poll_token = tok
+                threading.Thread(target=self._poll, args=(tok,), name="proxy-core-poll",
+                                 daemon=True).start()
+            except Exception as e:
+                self.log("dashboard: %s" % e)
+                _err("无法打开控制面板: %s" % e)
+        run_on_ui_thread(build)
+
+    def _on_dismiss(self):
+        global _DASH_OPEN
+        self._dashboard_page = "home"
+        _DASH_OPEN = False
+        self._poll_token = None
+        self._dlg = self._content = self._scroll = None
+        self._reload_settings(force=True)
+
+    def _poll(self, token):
+        """自动选择会随测速切换节点；只在“使用中的节点”变化时才重绘，避免打断滚动。"""
+        while True:
+            time.sleep(8)
+            if self._dlg is None or self._poll_token is not token:
+                return
+            if self._busy or not self._started:
+                continue
+            try:
+                snap = self._collect()
+                old = self._snap or {}
+                keys = ("active", "now", "running")
+                if snap.get("active") and snap.get("active") != old.get("active"):
+                    try:
+                        self._record_node_switch(snap["active"])
+                    except Exception as e:
+                        self.log("switch stats poll: %s" % e)
+                self._snap = snap
+                if any(snap.get(x) != old.get(x) for x in keys):
+                    if self._dashboard_page == "stats":
+                        run_on_ui_thread(self._render_switch_stats_page)
+                    else:
+                        run_on_ui_thread(lambda sn=snap: self._render(sn))
+            except Exception as e:
+                self.log("poll: %s" % e)
+
+    def _ui_refresh(self):
+        def go():
+            try:
+                snap = self._collect()
+                old = self._snap or {}
+                if snap.get("active") and snap.get("active") != old.get("active"):
+                    try:
+                        self._record_node_switch(snap["active"])
+                    except Exception as e:
+                        self.log("switch stats refresh: %s" % e)
+                self._snap = snap
+                if self._dlg is not None:
+                    if self._dashboard_page == "stats":
+                        run_on_ui_thread(self._render_switch_stats_page)
+                    else:
+                        run_on_ui_thread(lambda: self._render(snap))
+                else:  # 面板没开：刷新设置页上的节点卡片
+                    self._reload_settings()
+            except Exception as e:
+                self.log("dashboard refresh: %s" % e)
+                try:
+                    fallback = {"kind": self._kind(), "label": CORES[self._kind()]["label"],
+                                "installed": os.path.exists(_core_path(self._kind())),
+                                "tag": "", "running": bool(self._started), "port": self._port,
+                                "ctl_port": self._ctl_port, "now": "", "active": "",
+                                "n_sources": len(self._load_sources()), "groups": [], "cur_group": "",
+                                "cols": 1, "scopes": [], "node_scope": {}, "cur_src": "", "nodes": []}
+                    self._snap = fallback
+                    if self._dlg is not None:
+                        run_on_ui_thread(lambda sn=fallback: self._render(sn))
+                except Exception as fallback_error:
+                    self.log("dashboard fallback: %s" % fallback_error)
+        threading.Thread(target=go, name="proxy-core-ui", daemon=True).start()
+
+    # --- 数据 ---
+    def _scan_node_infos(self):
+        home, out, counts, node_src = _home(), {}, {}, {}
+        if len(self._info_cache) > 16:
+            self._info_cache = {}
+        for i, src in enumerate(self._load_sources()):
+            value, infos = src["value"], []
+            try:
+                if _is_sub_url(value):
+                    paths = [os.path.join(home, "s%d.%s" % (i, e)) for e in ("sub", "yaml")]
+                    paths = [x for x in paths if os.path.exists(x)]
+                    if paths:
+                        path = max(paths, key=os.path.getmtime)
+                        key = (path, os.path.getmtime(path))
+                        if key not in self._info_cache:
+                            with open(path, encoding="utf-8", errors="replace") as f:
+                                self._info_cache[key] = node_infos_from_text(f.read())
+                        infos = self._info_cache[key]
+                else:
+                    key = ("links", value)
+                    if key not in self._info_cache:
+                        self._info_cache[key] = node_infos_from_text(value)
+                    infos = self._info_cache[key]
+            except Exception as e:
+                self.log("scan nodes: %s" % e)
+            counts[i] = len(infos)
+            for name, info in infos:
+                out.setdefault(name, info)
+                node_src.setdefault(name, i)
+        self._src_counts, self._node_src = counts, node_src  # 节点名 -> 来源序号，用于“只看某个订阅”
+        return out
+
+    def _scope_counts(self):
+        out = {}
+        for i, s in enumerate(self._load_sources()):
+            key = ("s%d" % i) if _is_sub_url(s["value"]) else "nodes"
+            out[key] = out.get(key, 0) + self._src_counts.get(i, 0)
+        return out
+
+    def _collect(self):
+        kind = self._kind()
+        running = self._started and self._running_kind == kind
+        snap = {"kind": kind, "label": CORES[kind]["label"],
+                "installed": os.path.exists(_core_path(kind)),
+                "tag": str(self.get_setting("core_tag_" + kind, "") or ""),
+                "running": running, "port": self._port, "ctl_port": self._ctl_port,
+                "now": "", "active": "",
+                "n_sources": len(self._load_sources())}
+        groups = self._load_groups()
+        gset = {"G:" + g["name"] for g in groups}
+        cur = str(self.get_setting("cur_group", "") or "")
+        if cur and cur not in {g["name"] for g in groups}:
+            cur = ""
+        snap["groups"], snap["cur_group"] = groups, cur
+        snap["cols"] = 2 if str(self.get_setting("cols", "1")) == "2" else 1
+        infos = self._scan_node_infos()
+        sources = self._load_sources()
+        scopes, node_scope = [], {}
+        for i, src in enumerate(sources):
+            if _is_sub_url(src["value"]):
+                scopes.append({"key": "s%d" % i, "label": src["name"] or ("订阅%d" % (i + 1)),
+                               "count": self._src_counts.get(i, 0)})
+        n_single = sum(self._src_counts.get(i, 0) for i, x in enumerate(sources)
+                       if not _is_sub_url(x["value"]))
+        if any(not _is_sub_url(x["value"]) for x in sources):
+            scopes.append({"key": "nodes", "label": "单节点", "count": n_single})
+        for name, i in self._node_src.items():
+            if i < len(sources):
+                node_scope[name] = ("s%d" % i) if _is_sub_url(sources[i]["value"]) else "nodes"
+        cur_src = str(self.get_setting("cur_src", "") or "")
+        if cur_src not in {x["key"] for x in scopes}:
+            cur_src = ""
+        snap["scopes"], snap["node_scope"], snap["cur_src"] = scopes, node_scope, cur_src
+        names = []
+        if running and self._api is not None:
+            try:
+                d = self._api.req("GET", "/proxies/PROXY") or {}
+                snap["now"] = d.get("now", "")
+                names = [n for n in (d.get("all") or [])
+                         if n not in ("AUTO", "DIRECT", "direct") and n not in gset
+                         and not n.startswith("S:")]
+                # 当前选的是“自动 / 分组”时，顺着往下找出真正在用的节点
+                node, hops = snap["now"], 0
+                while node and (node == "AUTO" or node in gset or node.startswith(("S:", "G:"))) and hops < 3:
+                    node = (self._api.req("GET", "/proxies/" + _q(node)) or {}).get("now", "")
+                    hops += 1
+                snap["active"] = node
+            except Exception as e:
+                self.log("collect: %s" % e)
+        if not names:
+            names = list(infos)
+        snap["nodes"] = [{"name": n, "info": infos.get(n)} for n in names]
+        return snap
+
+    def _switch_stats_path(self):
+        return os.path.join(_home(), "node_switch_stats.json")
+
+    def _save_switch_stats(self, records):
+        path = self._switch_stats_path()
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False)
+        os.replace(path + ".tmp", path)
+
+    def _load_switch_stats(self):
+        with self._stats_lock:
+            try:
+                with open(self._switch_stats_path(), "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                return []
+            now = int(time.time())
+            cutoff = now - 30 * 86400
+            records = []
+            for item in data if isinstance(data, list) else []:
+                if not isinstance(item, dict) or not isinstance(item.get("node"), str):
+                    continue
+                try:
+                    at = int(item.get("at", 0))
+                except (ValueError, TypeError, OverflowError):
+                    continue
+                if item["node"] and cutoff <= at <= now:
+                    records.append({"node": item["node"], "at": at})
+            records.sort(key=lambda item: item["at"])
+            if records != data:
+                self._save_switch_stats(records)
+            return records
+
+    def _stats_cleanup_loop(self):
+        while not self._stats_stop.is_set():
+            try:
+                self._load_switch_stats()
+            except Exception as e:
+                self.log("stats cleanup: %s" % e)
+            if self._stats_stop.wait(3600):
+                return
+
+    def _record_node_switch(self, node):
+        if not node:
+            return
+        with self._stats_lock:
+            records = self._load_switch_stats()
+            if records and records[-1]["node"] == str(node):
+                return
+            records.append({"node": str(node), "at": int(time.time())})
+            self._save_switch_stats(records)
+
+    def _open_switch_stats_page(self):
+        if self._dlg is not None:
+            try:
+                self._dlg.dismiss()
+            except Exception:
+                pass
+        def build():
+            global _DASH_OPEN
+            try:
+                self._dashboard_page = "stats"
+                self._stats_tab = "usage"
+                self._stats_limit = 20
+                act = get_last_fragment().getParentActivity()
+                self._act = act
+                self._density = float(act.getResources().getDisplayMetrics().density)
+                try:
+                    dark = bool(jclass("org.telegram.ui.ActionBar.Theme").isCurrentThemeDark())
+                except Exception:
+                    dark = False
+                self._pal = _PAL_DARK if dark else _PAL_LIGHT
+                dlg = jclass("android.app.Dialog")(act, jclass("android.R$style").Theme_DeviceDefault_NoActionBar)
+                root = self._vbox()
+                root.setBackgroundColor(self._c("bg"))
+                try:
+                    top = int(jclass("org.telegram.messenger.AndroidUtilities").statusBarHeight)
+                except Exception:
+                    top = self._dp(28)
+                root.setPadding(0, top, 0, 0)
+                bar = self._hbox()
+                bar.setPadding(self._dp(20), self._dp(12), self._dp(20), self._dp(8))
+                title = self._text("节点统计", 22, "text", True)
+                title.setLayoutParams(self._lp(0, -2, weight=1))
+                back = self._text("返回", 16, "accent", True)
+                back.setPadding(self._dp(8), self._dp(8), self._dp(8), self._dp(8))
+                back.setClickable(True)
+                back.setOnClickListener(_VClick(lambda: dlg.dismiss()))
+                bar.addView(title)
+                bar.addView(back)
+                scroll = jclass("android.widget.ScrollView")(act)
+                content = self._vbox()
+                content.setPadding(0, 0, 0, self._dp(40))
+                scroll.addView(content)
+                root.addView(bar)
+                root.addView(scroll, self._lp(-1, 0, weight=1))
+                dlg.setContentView(root)
+                win = dlg.getWindow()
+                win.setBackgroundDrawable(jclass("android.graphics.drawable.ColorDrawable")(self._c("bg")))
+                win.setLayout(-1, -1)
+                dismiss = _Dismiss(self._on_dismiss)
+                self._keep = [dismiss]
+                dlg.setOnDismissListener(dismiss)
+                self._dlg, self._content, self._scroll = dlg, content, scroll
+                _DASH_OPEN = True
+                dlg.show()
+                self._ui_refresh()
+                tok = object()
+                self._poll_token = tok
+                threading.Thread(target=self._poll, args=(tok,), name="proxy-core-stats-poll", daemon=True).start()
+            except Exception as e:
+                self.log("stats page: %s" % e)
+                _err("无法打开节点统计: %s" % e)
+        run_on_ui_thread(build)
+
+    def _show_dashboard_home(self):
+        if self._dlg is not None:
+            self._dlg.dismiss()
+
+    @staticmethod
+    def _format_usage(seconds):
+        seconds = max(0, int(seconds))
+        days, seconds = divmod(seconds, 86400)
+        hours, seconds = divmod(seconds, 3600)
+        minutes, seconds = divmod(seconds, 60)
+        if days:
+            return "%d天%d小时%d分" % (days, hours, minutes)
+        if hours:
+            return "%d小时%d分" % (hours, minutes)
+        if minutes:
+            return "%d分%d秒" % (minutes, seconds)
+        return "%d秒" % seconds
+
+    @staticmethod
+    def _stats_totals(records, now):
+        totals = {}
+        cutoff = now - 30 * 86400
+        for index, item in enumerate(records):
+            end = records[index + 1]["at"] if index + 1 < len(records) else now
+            seconds = max(0, min(now, end) - max(cutoff, item["at"]))
+            totals[item["node"]] = totals.get(item["node"], 0) + seconds
+        return sorted(totals.items(), key=lambda item: (-item[1], item[0]))
+
+    def _set_stats_tab(self, tab):
+        self._stats_tab = tab
+        self._stats_limit = 20
+        self._render_switch_stats_page()
+        if self._scroll is not None:
+            self._scroll.scrollTo(0, 0)
+
+    def _more_stats_records(self):
+        self._stats_limit = min(self._stats_limit + 20, 100)
+        self._render_switch_stats_page()
+
+    def _stats_pie(self, values):
+        colors = ("#2878D0", "#23A57D", "#D58525", "#C95875", "#8064B6", "#2495A8", "#78828D")
+        positive = [(name, seconds) for name, seconds in values if seconds > 0]
+        slices = positive[:6]
+        if len(positive) > 6:
+            slices.append(("其他节点（%d个）" % (len(positive) - 6), sum(x[1] for x in positive[6:])))
+        total = sum(seconds for _, seconds in slices)
+        if not total:
+            return []
+        size = self._dp(240)
+        bitmap = jclass("android.graphics.Bitmap").createBitmap(
+            size, size, jclass("android.graphics.Bitmap$Config").ARGB_8888)
+        canvas = jclass("android.graphics.Canvas")(bitmap)
+        paint = jclass("android.graphics.Paint")(1)
+        rect = jclass("android.graphics.RectF")(2.0, 2.0, float(size - 2), float(size - 2))
+        start = -90.0
+        legend = []
+        for index, (name, seconds) in enumerate(slices):
+            color = colors[index]
+            # Force ARGB int: the long overload expects a packed ColorSpace value.
+            paint.setColor(jint(jclass("android.graphics.Color").parseColor(color)))
+            sweep = 360.0 * seconds / total
+            if index == len(slices) - 1:
+                sweep = 270.0 - start
+            canvas.drawArc(rect, float(start), float(sweep), True, paint)
+            start += sweep
+            legend.append((name, seconds, color))
+        image = jclass("android.widget.ImageView")(self._act)
+        image.setImageBitmap(bitmap)
+        image.setAdjustViewBounds(True)
+        image.setScaleType(jclass("android.widget.ImageView$ScaleType").FIT_CENTER)
+        image.setContentDescription("最近30天节点使用时长占比饼图")
+        self._content.addView(image, self._lp(-1, size, m=(16, 8, 16, 12)))
+        return legend
+
+    def _render_switch_stats_page(self):
+        if self._dlg is None or self._content is None or self._dashboard_page != "stats":
+            return
+        self._content.removeAllViews()
+        records = self._load_switch_stats()
+        totals = self._stats_totals(records, int(time.time()))
+        tabs = self._hbox()
+        tabs.addView(self._button("使用统计", "primary" if self._stats_tab == "usage" else "outline",
+                                  lambda: self._set_stats_tab("usage"), h=44, weight=1, m=(0, 0, 4, 0), sp=14))
+        tabs.addView(self._button("切换记录", "primary" if self._stats_tab == "records" else "outline",
+                                  lambda: self._set_stats_tab("records"), h=44, weight=1, m=(4, 0, 0, 0), sp=14))
+        self._content.addView(tabs, self._lp(-1, -2, m=(16, 8, 16, 12)))
+        heading = self._text("最近30天 · " + ("使用时长占比" if self._stats_tab == "usage" else "切换记录（北京时间）"), 16, "text", True)
+        self._content.addView(heading, self._lp(-1, -2, m=(16, 8, 16, 12)))
+        if self._stats_tab == "usage":
+            total = sum(seconds for _, seconds in totals)
+            try:
+                legend = self._stats_pie(totals)
+                for name, seconds, color in legend:
+                    label = self._text("● %s  %.1f%%" % (name, 100.0 * seconds / total), 14, "text")
+                    label.setTextColor(jclass("android.graphics.Color").parseColor(color))
+                    self._content.addView(label, self._lp(-1, -2, m=(20, 4, 20, 4)))
+            except Exception as e:
+                details = traceback.format_exc()
+                self.log("stats pie: %s" % e)
+                notice = self._text("饼图暂不可用 · 点击查看错误详情", 14, "accent")
+                notice.setPadding(self._dp(16), self._dp(12), self._dp(16), self._dp(12))
+                notice.setClickable(True)
+                notice.setOnClickListener(_VClick(lambda detail=details: self._show_stats_error(detail)))
+                self._content.addView(notice, self._lp(-1, -2))
+            usage_grid = self._vbox()
+            for start in range(0, len(totals), 2):
+                usage_row = self._hbox()
+                pair = totals[start:start + 2]
+                for name, seconds in pair:
+                    card = self._card(compact=True, pad=12)
+                    card.addView(self._text(name, 14, "text", True, lines=2))
+                    percent = 100.0 * seconds / total if total else 0.0
+                    card.addView(self._text("%s · %.1f%%" % (self._format_usage(seconds), percent), 13, "accent"))
+                    usage_row.addView(card)
+                if len(pair) == 1:
+                    usage_row.addView(self._vbox(), self._lp(0, 1, weight=1, m=(6, 6, 6, 6)))
+                usage_grid.addView(usage_row)
+            self._content.addView(usage_grid, self._lp(-1, -2))
+            if not totals:
+                self._content.addView(self._text("暂无使用时长", 14, "sub"), self._lp(-1, -2, m=(16, 8, 16, 8)))
+        else:
+            count = min(len(records), 100)
+            visible = list(reversed(records[-count:]))[:self._stats_limit]
+            self._content.addView(self._text("共 %d 条 · 最新在前 · 每次显示20条" % count, 13, "sub"), self._lp(-1, -2, m=(16, 0, 16, 8)))
+            grid = self._vbox()
+            for start in range(0, len(visible), 2):
+                row = self._hbox()
+                pair = visible[start:start + 2]
+                for item in pair:
+                    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(item["at"] + 8 * 3600))
+                    card = self._card(compact=True, pad=12)
+                    card.addView(self._text(item["node"], 14, "text", True, lines=2))
+                    card.addView(self._text(stamp, 12, "sub"))
+                    row.addView(card)
+                if len(pair) == 1:
+                    row.addView(self._vbox(), self._lp(0, 1, weight=1, m=(6, 6, 6, 6)))
+                grid.addView(row)
+            self._content.addView(grid, self._lp(-1, -2))
+            if count > self._stats_limit and self._stats_limit < 100:
+                self._content.addView(self._button("加载更多记录（每次20条）", "outline", self._more_stats_records, h=44, m=(16, 8, 16, 8)))
+            if not records:
+                self._content.addView(self._text("暂无切换记录", 14, "sub"), self._lp(-1, -2, m=(16, 8, 16, 8)))
+        clear = self._button("清空统计", "gray", self._clear_switch_stats, h=44)
+        self._content.addView(clear, self._lp(-1, self._dp(48), m=(16, 12, 16, 12)))
+
+    def _show_stats_error(self, details):
+        message = "Proxy Core %s\n\n%s" % (__version__, details)
+        try:
+            builder = jclass("android.app.AlertDialog$Builder")(self._act)
+            builder.setTitle("饼图错误详情")
+            scroll = jclass("android.widget.ScrollView")(self._act)
+            text = self._text(message, 13, "text")
+            text.setTextIsSelectable(True)
+            text.setPadding(self._dp(16), self._dp(12), self._dp(16), self._dp(12))
+            scroll.addView(text)
+            builder.setView(scroll)
+            builder.setPositiveButton("关闭", None)
+            builder.show()
+        except Exception as e:
+            self.log("stats error dialog: %s" % e)
+            text = self._text(message, 13, "text")
+            text.setTextIsSelectable(True)
+            self._content.addView(text, self._lp(-1, -2, m=(16, 8, 16, 8)))
+            _toast("错误详情已展开在页面底部")
+
+    def _clear_switch_stats(self):
+        with self._stats_lock:
+            self._save_switch_stats([])
+        _toast("切换记录已清空")
+        if self._dashboard_page == "stats":
+            run_on_ui_thread(self._render_switch_stats_page)
+        return True
+
+    # --- 渲染 ---
+    def _delay_text(self, name):
+        d = self._delay.get(name)
+        if d is None:
+            return "未检测", "sub"
+        if d == -2:
+            return "检测中…", "sub"
+        if d <= 0:
+            return "timeout", "bad"
+        return "%d ms" % d, ("ok" if d < 300 else "warn")
+
+    def _apply_delay(self, name):
+        tv = self._delay_views.get(name)
+        if tv is None:
+            return
+        text, color = self._delay_text(name)
+        tv.setText(text)
+        tv.setTextColor(self._c(color))
+
+    def _render(self, snap):
+        if self._dlg is None or self._content is None:
+            return
+        try:
+            self._render_impl(snap)
+        except Exception as e:
+            self.log("dashboard render: %s" % e)
+            try:
+                self._content.removeAllViews()
+                message = jclass("android.widget.TextView")(self._act)
+                message.setText("控制面板渲染失败：%s\\n请关闭后重新打开；详细原因已写入插件日志。" % e)
+                message.setTextSize(15.0)
+                message.setPadding(self._dp(24), self._dp(24), self._dp(24), self._dp(24))
+                message.setTextColor(self._c("text"))
+                self._content.addView(message, self._lp(-1, -2))
+                retry = self._button("重新加载", "primary", self._ui_refresh)
+                self._content.addView(retry, self._lp(-1, self._dp(48), m=(16, 8, 16, 8)))
+            except Exception as fallback_error:
+                self.log("dashboard render fallback: %s" % fallback_error)
+
+    def _render_impl(self, snap):
+        if self._dlg is None or self._content is None:
+            return
+        self._snap = snap
+        try:
+            y = int(self._scroll.getScrollY())
+        except Exception:
+            y = 0
+        ct = self._content
+        ct.removeAllViews()
+        self._delay_views = {}
+        busy, running = self._busy, snap["running"]
+
+        # 状态卡片
+        card = self._card()
+        row = self._hbox()
+        row.addView(self._icon())
+        col = self._vbox()
+        col.setPadding(self._dp(16), self._dp(4), self._dp(4), self._dp(4))
+        col.setLayoutParams(self._lp(0, -2, weight=1))
+        col.addView(self._text("已连接" if running else "断开连接", 22,
+                               "text" if running else "off", True))
+        if busy:
+            col.addView(self._text(busy, 13, "sub", lines=2))
+        elif not snap["installed"]:
+            col.addView(self._text("连接文件不随插件提供，需要下载一次", 13, "sub", lines=2))
+        elif running:
+            info = next((n["info"] for n in snap["nodes"] if n["name"] == snap.get("active")), None)
+            proto = "%s · %s · %s" % (info["proto"], info["net"], info["sec"]) if info else snap["label"]
+            col.addView(self._text(proto, 13, "accent", lines=2))
+            col.addView(self._text("本地端口 127.0.0.1:%d" % snap["port"], 13, "sub"))
+            col.addView(self._text("控制端口 127.0.0.1:%d" % snap.get("ctl_port", 0), 13, "sub"))
+            if snap.get("active"):
+                now = snap.get("now", "")
+                via = "（自动选择）" if now == "AUTO" else ("（分组自动选择）" if now.startswith("G:") else "")
+                col.addView(self._text("使用中：" + snap["active"] + via, 13, "sub", lines=2))
+        else:
+            sub = "%s 已就绪%s" % (snap["label"], (" · " + snap["tag"]) if snap["tag"] else "")
+            col.addView(self._text(sub, 13, "sub", lines=2))
+        row.addView(col)
+        card.addView(row)
+        if busy:
+            card.addView(self._button(busy, "gray", lambda: None))
+        elif not snap["installed"]:
+            card.addView(self._button("安装组件", "primary", self._dash_primary))
+        elif running:
+            card.addView(self._button("断开连接", "gray", self._dash_primary))
+        else:
+            card.addView(self._button("连接", "primary", self._dash_primary))
+        ct.addView(card)
+
+        # 工具按钮
+        def tools(items):
+            r = self._hbox()
+            r.setLayoutParams(self._lp(-1, -2, m=(12, 2, 12, 2)))
+            for text, fn in items:
+                r.addView(self._button(text, "outline", fn, h=44, weight=1, m=(4, 4, 4, 4), sp=14))
+            ct.addView(r)
+        tools([("内核：" + snap["label"], lambda: self._choose_core()),
+               ("订阅管理", lambda: self._manage()),
+               ("分组管理", lambda: self._group_manage())])
+
+        cols = snap["cols"]
+
+        def chip_row(items):
+            hs = jclass("android.widget.HorizontalScrollView")(self._act)
+            hs.setHorizontalScrollBarEnabled(False)
+            crow = self._hbox()
+            crow.setPadding(self._dp(10), self._dp(6), self._dp(10), self._dp(6))
+            for text, sel, fn in items:
+                crow.addView(self._chip(text, sel, fn))
+            hs.addView(crow)
+            ct.addView(hs)
+
+        # 订阅标签（点击即“只看这个订阅”）
+        scopes, cur_src = snap["scopes"], snap["cur_src"]
+        if len(scopes) >= 2:
+            items = [("全部订阅", cur_src == "", lambda: self._run_bg(lambda: self._use_src("")))]
+            for sc in scopes:
+                items.append(("%s（%d）" % (sc["label"], sc["count"]), cur_src == sc["key"],
+                              (lambda key: (lambda: self._run_bg(lambda: self._use_src(key))))(sc["key"])))
+            chip_row(items)
+
+        # 分组标签（点击即“使用该分组”）
+        groups, cur = snap["groups"], snap["cur_group"]
+        all_names = {n["name"] for n in snap["nodes"]}
+        items = [("全部分组", cur == "", lambda: self._run_bg(lambda: self._use_group("")))]
+        for g in groups:
+            valid = len([x for x in g["nodes"] if x in all_names])
+            items.append(("%s（%d）" % (g["name"], valid), cur == g["name"],
+                          (lambda nm: (lambda: self._run_bg(lambda: self._use_group(nm))))(g["name"])))
+        items.append(("＋ 新建分组", False, lambda: self._group_new()))
+        chip_row(items)
+
+        # 过滤：订阅范围 + 分组（取交集）
+        members = None
+        if cur:
+            g = next((x for x in groups if x["name"] == cur), None)
+            members = set(g["nodes"]) if g else None
+        nodes = snap["nodes"]
+        scope_label = ""
+        if cur_src:
+            nodes = [n for n in nodes if snap["node_scope"].get(n["name"]) == cur_src]
+            scope_label = next((x["label"] for x in scopes if x["key"] == cur_src), "")
+        if members is not None:
+            nodes = [n for n in nodes if n["name"] in members]
+
+        if not snap["nodes"]:
+            c = self._card()
+            c.addView(self._text(
+                "还没有订阅，请点上方“订阅管理”添加" if snap["n_sources"] == 0
+                else "暂无节点，请点“更新订阅”拉取", 15, "sub"))
+            ct.addView(c)
+        else:
+            head = self._hbox()
+            head.setPadding(self._dp(24), self._dp(12), self._dp(24), self._dp(4))
+            parts = []
+            if cur_src:
+                parts.append("订阅「%s」" % scope_label)
+            if members is not None:
+                parts.append("分组「%s」" % cur)
+            title = (" · ".join(parts) + " · " if parts else "") + "节点（%d）" % len(nodes)
+            t = self._text(title, 14, "sub", True, lines=2)
+            t.setLayoutParams(self._lp(0, -2, weight=1))
+            head.addView(t)
+            head.addView(self._small_button("布局：" + ("双列" if cols == 2 else "单列"),
+                                            lambda: self._toggle_cols()))
+            head.addView(self._small_button("全部测速", lambda: self._run_bg(self._test_all)))
+            ct.addView(head)
+
+            now = snap["now"]
+            auto_target = self._scope_target()
+            if (members is not None or cur_src) and not nodes:
+                c = self._card()
+                c.addView(self._text("当前筛选下没有可用节点：可以换个订阅 / 分组，或在“分组管理”里重新勾选", 15, "sub"))
+                ct.addView(c)
+            else:
+                auto_sel = running and now == auto_target
+                c = self._card(selected=auto_sel, on_click=lambda: self._run_bg(
+                    lambda: self._select_node(auto_target)))
+                ico = self._hbox()
+                ico.addView(self._icon())
+                col = self._vbox()
+                col.setPadding(self._dp(16), 0, 0, 0)
+                col.addView(self._text(
+                    ("✔ " if auto_sel else "") +
+                    ("自动选择最快（分组：%s）" % cur if members is not None
+                     else ("自动选择最快（订阅：%s）" % scope_label if cur_src else "自动选择最快节点")),
+                    18, "text", True))
+                col.addView(self._text(
+                    "URLTEST · 只在该分组内测速选择" if members is not None
+                    else ("URLTEST · 只在该订阅内测速选择" if cur_src
+                          else "URLTEST · 每 5 分钟自动检测"), 14, "accent"))
+                col.addView(self._text(
+                    ("使用中：" + snap["active"]) if (auto_sel and snap["active"])
+                    else ("当前使用" if auto_sel else "点击使用"), 14, "sub", lines=2))
+                ico.addView(col)
+                c.addView(ico)
+                ct.addView(c)
+
+            shown = nodes[:300]
+            if cols == 2:
+                for i in range(0, len(shown), 2):
+                    rowc = self._hbox(48)
+                    rowc.setLayoutParams(self._lp(-1, -2, m=(6, 0, 6, 0)))
+                    for j in range(2):
+                        if i + j < len(shown):
+                            rowc.addView(self._node_card(shown[i + j], snap, True))
+                        else:  # 单数时补一个占位，保证宽度一致
+                            sp = jclass("android.view.View")(self._act)
+                            sp.setLayoutParams(self._lp(0, 1, weight=1, m=(6, 6, 6, 6)))
+                            rowc.addView(sp)
+                    ct.addView(rowc)
+            else:
+                for n in shown:
+                    ct.addView(self._node_card(n, snap, False))
+            if len(nodes) > 300:
+                c = self._card()
+                c.addView(self._text("仅显示前 300 个节点（共 %d 个）" % len(nodes), 13, "sub"))
+                ct.addView(c)
+        try:
+            self._scroll.post(_Run(lambda: self._scroll.scrollTo(0, y)))
+        except Exception:
+            pass
+
+    def _delete_node_source(self, name):
+        idx = self._node_src.get(name)
+        sources = self._load_sources()
+        if idx is None or idx >= len(sources) or _is_sub_url(sources[idx]["value"]):
+            _err("无法定位这个单节点来源")
+            return
+        src = sources[idx]
+        if len(re.split(r"\s+", src["value"].strip())) != 1:
+            _err("该来源包含多个节点，请在订阅管理中编辑")
+            return
+        message_dialog("删除节点", "确定删除「%s」？" % name, "删除", lambda: self._save_and_apply(
+            sources[:idx] + sources[idx + 1:], "已删除节点：" + name, quiet=True))
+
+    def _node_card(self, n, snap, compact):
+        name, info = n["name"], n["info"]
+        sel = snap["running"] and snap.get("active") == name
+        src_idx = self._node_src.get(name)
+        sources = self._load_sources()
+        deletable = (src_idx is not None and src_idx < len(sources)
+                     and not _is_sub_url(sources[src_idx]["value"])
+                     and len(re.split(r"\s+", sources[src_idx]["value"].strip())) == 1)
+        c = self._card(selected=sel, compact=compact, pad=16,
+                       on_click=lambda: self._run_bg(lambda: self._select_node(name)))
+        title = name
+        line2 = ("%s · %s · %s" % (info["proto"], info["net"], info["sec"])) if info else "—"
+        text, color = self._delay_text(name)
+        dtv = self._text(text, 13, color)
+        self._delay_views[name] = dtv
+        test = lambda: self._run_bg(lambda: self._test_delay(name))
+        dtv.setClickable(True)
+        dtv.setOnClickListener(_VClick(test))
+        if compact:
+            trow = self._hbox()
+            tt = self._text(title, 15, "text", True, lines=2)
+            tt.setLayoutParams(self._lp(0, -2, weight=1))
+            trow.addView(tt)
+            if sel:
+                trow.addView(self._badge("使用中"))
+            if deletable:
+                trow.addView(self._small_button("删除", lambda: self._delete_node_source(name)))
+            c.addView(trow)
+            # 双列卡片较窄：协议和延迟分行，避免协议文本或延迟被截断。
+            proto = self._text(line2, 12, "accent", lines=2)
+            proto.setLayoutParams(self._lp(-1, -2, m=(0, 12, 0, 0)))
+            c.addView(proto)
+            delay_row = self._hbox()
+            delay_row.setLayoutParams(self._lp(-1, -2, m=(0, 2, 0, 0)))
+            dtv.setGravity(5)
+            dtv.setPadding(0, 0, 0, 0)
+            delay_row.addView(dtv, self._lp(-1, -2, weight=1))
+            c.addView(delay_row)
+        else:
+            r = self._hbox()
+            r.addView(self._icon(44, 16))
+            col = self._vbox()
+            col.setPadding(self._dp(12), 0, 0, 0)
+            col.setLayoutParams(self._lp(0, -2, weight=1))
+            trow = self._hbox()
+            tt = self._text(title, 16, "text", True, lines=2)
+            tt.setLayoutParams(self._lp(0, -2, weight=1))
+            trow.addView(tt)
+            if sel:
+                trow.addView(self._badge("使用中"))
+            if deletable:
+                trow.addView(self._small_button("删除", lambda: self._delete_node_source(name)))
+            col.addView(trow)
+            info_row = self._hbox()
+            info_row.setLayoutParams(self._lp(-1, -2, m=(0, 8, 0, 0)))
+            proto = self._text(line2, 13, "accent", lines=1)
+            proto.setLayoutParams(self._lp(0, -2, weight=1, m=(0, 0, 12, 0)))
+            info_row.addView(proto)
+            dtv.setGravity(5)
+            dtv.setPadding(self._dp(8), 0, 0, 0)
+            info_row.addView(dtv)
+            col.addView(info_row)
+            r.addView(col)
+            c.addView(r)
+        return c
+
+    # --- 布局切换 ---
+    def _toggle_cols(self):
+        cur = str(self.get_setting("cols", "1"))
+        self.set_setting("cols", "1" if cur == "2" else "2")
+        self._ui_refresh()
+
+    # --- 节点分组 ---
+    def _load_groups(self):
+        try:
+            raw = json.loads(self.get_setting("groups", "[]") or "[]")
+        except Exception:
+            raw = []
+        out, seen = [], set()
+        for g in raw if isinstance(raw, list) else []:
+            if not isinstance(g, dict):
+                continue
+            name = str(g.get("name", "")).strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            out.append({"name": name, "nodes": [str(x) for x in (g.get("nodes") or [])]})
+        return out
+
+    def _save_groups(self, groups):
+        self.set_setting("groups", json.dumps(groups, ensure_ascii=False))
+
+    def _groups_for_config(self, known):
+        """写进内核配置的分组：已知节点里至少要有一个成员，避免空分组退化成直连。"""
+        out = []
+        for g in self._load_groups():
+            nodes = [n for n in g["nodes"] if n in known] if known else list(g["nodes"])
+            if nodes:
+                out.append({"name": g["name"], "nodes": nodes})
+        return out
+
+    def _all_node_names(self):
+        names = [n["name"] for n in (self._snap or {}).get("nodes", [])]
+        return names or list(self._scan_node_infos())
+
+    def _restore_pick(self):
+        """内核重启后，恢复上次选的节点 / 分组。"""
+        api = self._api
+        pick = str(self.get_setting("last_pick", "") or "")
+        if api is None or not pick:
+            return
+        try:
+            allv = (api.req("GET", "/proxies/PROXY") or {}).get("all") or []
+            if pick not in allv:
+                return
+            if pick.startswith("G:"):
+                group_name = pick[2:].split("@S:", 1)[0]
+                members = next((g["nodes"] for g in self._load_groups()
+                                if g["name"] == group_name), [])
+                if not any(m in allv for m in members):
+                    return
+            elif pick.startswith("S:") and not self._scope_counts().get(pick[2:]):
+                return
+            api.req("PUT", "/proxies/PROXY", {"name": pick})
+        except Exception as e:
+            self.log("restore pick: %s" % e)
+
+    def _scope_target(self):
+        """当前自动选择目标：订阅和分组同时选择时使用两者交集。"""
+        g = str(self.get_setting("cur_group", "") or "")
+        src = str(self.get_setting("cur_src", "") or "")
+        if g and src:
+            return "G:" + g + "@S:" + src
+        if g:
+            return "G:" + g
+        return ("S:" + src) if src else "AUTO"
+
+    def _apply_scope(self):
+        target = self._scope_target()
+        self.set_setting("last_pick", target)
+        if self._started and self._api is not None:
+            try:
+                self._api.req("PUT", "/proxies/PROXY", {"name": target})
+            except Exception as e:
+                _err("切换失败: %s（请先点“更新订阅”让内核生成对应的分组）" % e)
+        self._ui_refresh()
+
+    def _use_group(self, name):
+        """选择分组；可与当前订阅筛选叠加。"""
+        self.set_setting("cur_group", name)
+        self._apply_scope()
+
+    def _use_src(self, key):
+        """选择订阅；可与当前分组筛选叠加。"""
+        self.set_setting("cur_src", key)
+        self._apply_scope()
+
+    def _apply_groups(self, groups, tip):
+        self._save_groups(groups)
+        valid = {g["name"] for g in groups}
+        cur = str(self.get_setting("cur_group", "") or "")
+        if cur and cur not in valid:
+            self.set_setting("cur_group", "")
+            self.set_setting("last_pick", "AUTO")
+        _info(tip)
+        if self._started:  # 分组写在内核配置里，需要重启内核才生效
+            self._busy_run("正在应用分组…", self._start)
+        else:
+            self._ui_refresh()
+
+    def _group_manage(self):
+        groups = self._load_groups()
+        labels = ["＋ 新建分组"] + ["%s · %d 个节点" % (g["name"], len(g["nodes"])) for g in groups]
+        list_dialog("分组管理（%d）" % len(groups), labels,
+                    lambda i: self._group_new() if i == 0 else self._group_menu(i - 1))
+
+    def _group_menu(self, idx):
+        groups = self._load_groups()
+        if idx >= len(groups):
+            return
+        g = groups[idx]
+
+        def pick(i):
+            if i == 0:
+                self._group_pick_members(g["name"], g["nodes"], idx)
+            elif i == 1:
+                self._group_rename(idx)
+            else:
+                self._group_delete(idx)
+        list_dialog("分组「%s」" % g["name"], ["编辑节点（勾选）", "重命名", "删除"], pick)
+
+    def _group_new(self):
+        def ok(vals):
+            name = vals[0].strip()
+            if not name:
+                _toast("分组名称不能为空")
+                return False
+            if any(g["name"] == name for g in self._load_groups()):
+                _toast("已有同名分组")
+                return False
+            self._group_pick_members(name, [], None)
+        input_dialog("新建分组", ["分组名称"], [""], ok)
+
+    def _group_pick_members(self, name, current, idx):
+        names = self._all_node_names()
+        if not names:
+            _err("还没有节点，请先添加订阅并更新")
+            return
+        checked = [n in current for n in names]
+
+        def ok(state):
+            sel = [n for n, c in zip(names, state) if c]
+            kept = [m for m in current if m not in names]  # 订阅里暂时消失的节点保留
+            groups = self._load_groups()
+            item = {"name": name, "nodes": sel + kept}
+            if idx is None:
+                groups.append(item)
+            elif idx < len(groups):
+                groups[idx] = item
+            self._apply_groups(groups, "分组「%s」已保存（%d 个节点）" % (name, len(item["nodes"])))
+        multi_dialog("勾选「%s」的节点（%d）" % (name, len(names)), names, checked, ok, searchable=True)
+
+    def _group_rename(self, idx):
+        groups = self._load_groups()
+        if idx >= len(groups):
+            return
+        old = groups[idx]["name"]
+
+        def ok(vals):
+            new = vals[0].strip()
+            cur = self._load_groups()
+            if not new:
+                _toast("分组名称不能为空")
+                return False
+            if any(g["name"] == new for i, g in enumerate(cur) if i != idx):
+                _toast("已有同名分组")
+                return False
+            cur[idx]["name"] = new
+            if str(self.get_setting("cur_group", "") or "") == old:
+                self.set_setting("cur_group", new)
+            if str(self.get_setting("last_pick", "") or "") == "G:" + old:
+                self.set_setting("last_pick", "G:" + new)
+            self._apply_groups(cur, "已重命名为「%s」" % new)
+        input_dialog("重命名分组", ["分组名称"], [old], ok)
+
+    def _group_delete(self, idx):
+        groups = self._load_groups()
+        if idx >= len(groups):
+            return
+        removed = groups.pop(idx)
+        self._apply_groups(groups, "已删除分组「%s」" % removed["name"])
+
+    # --- 面板动作 ---
+    def _run_bg(self, fn):
+        def go():
+            try:
+                fn()
+            except Exception as e:
+                self.log("dashboard action: %s" % e)
+                _err(str(e))
+        threading.Thread(target=go, name="proxy-core", daemon=True).start()
+
+    def _busy_run(self, msg, fn):
+        if self._busy:
+            return
+        self._busy = msg
+        self._ui_refresh()
+
+        def go():
+            try:
+                fn()
+            except NeedRestart as e:
+                self._ask_restart(str(e))
+            except Exception as e:
+                self.log("ProxyCore: %s" % e)
+                _err(str(e))
+            finally:
+                self._busy = ""
+                self._ui_refresh()
+        threading.Thread(target=go, name="proxy-core", daemon=True).start()
+
+    def _dash_primary(self):
+        if self._busy:
+            return
+        snap = self._snap or {}
+        kind = self._kind()
+        if not snap.get("installed"):
+            self._busy_run("正在下载组件…", lambda: self._install_or_update(kind, force=True))
+        elif snap.get("running"):
+            self._busy_run("正在断开…", self._manual_stop)
+        else:
+            self._busy_run("正在连接…", self._manual_start)
+
+    def _test_active(self):
+        if not self._started or self._api is None:
+            raise RuntimeError("请先连接")
+        snap = self._snap or self._collect()
+        name = str(snap.get("active", "") or "")
+        if not name or name in ("AUTO", "direct"):
+            raise RuntimeError("当前没有可测试的实际节点")
+        self._run_bg(lambda: self._test_delay(name))
+        _toast("正在测试当前节点")
+
+    def _select_node(self, name):
+        if not self._started or self._api is None:
+            raise RuntimeError("请先连接")
+        self._api.req("PUT", "/proxies/PROXY", {"name": name})
+        self.set_setting("last_pick", name)
+        _info("已切换: " + ("自动选择" if name == "AUTO" else (
+            "分组「%s」" % name[2:] if name.startswith("G:") else name)))
+        self._ui_refresh()
+
+    def _scope_group_of(self, name):
+        """节点名 → 它所属的自动选择组（S:sN / S:nodes），用于单节点测速时缩小组测速范围。"""
+        src = (getattr(self, "_node_src", None) or {}).get(str(name))
+        if src is None:
+            return ""
+        sources = self._load_sources()
+        if src < len(sources) and _is_sub_url(sources[src]["value"]):
+            return "S:s%d" % src
+        return "S:nodes"
+
+    def _test_delay(self, name):
+        if not self._started or self._api is None:
+            raise RuntimeError("请先连接")
+        self._delay[name] = -2
+        run_on_ui_thread(lambda: self._apply_delay(name))
+        try:
+            d = self._delay_one(self._api, name, self._scope_group_of(name))
+        except Exception as e:
+            d = 0
+            self._api.last_delay_error = str(e)[:48] or e.__class__.__name__
+        if d > 0:
+            self._delay.pop(name + "__error", None)
+        else:
+            self._delay[name + "__error"] = getattr(self._api, "last_delay_error", "内核未返回有效延迟")
+        self._delay[name] = d if d > 0 else 0
+        run_on_ui_thread(lambda: self._apply_delay(name))
+        if d <= 0:
+            try:
+                target = self._scope_target()
+                current = (self._api.req("GET", "/proxies/PROXY") or {}).get("now", "")
+                if target and target != current:
+                    self._api.req("PUT", "/proxies/PROXY", {"name": target})
+                    self.set_setting("last_pick", target)
+                    _toast("当前节点测速失败，已自动切换到自动选择")
+            except Exception as e:
+                self.log("delay fallback: %s" % e)
+        self._ui_refresh()
+
+    def _test_all(self):
+        if not self._started or self._api is None:
+            raise RuntimeError("请先连接")
+        snap = self._snap or {}
+        nodes = snap.get("nodes", [])
+        cur_src = str(self.get_setting("cur_src", "") or "")
+        scopes = {x["key"] for x in snap.get("scopes", [])}
+        if cur_src not in scopes:
+            cur_src = ""
+        cur_group = str(self.get_setting("cur_group", "") or "")
+        groups = snap.get("groups", [])
+        group = next((g for g in groups if g["name"] == cur_group), None)
+        members = set(group["nodes"]) if group else None
+        names = [n["name"] for n in nodes
+                 if (not cur_src or snap.get("node_scope", {}).get(n["name"]) == cur_src)
+                 and (members is None or n["name"] in members)]
+        if not names:
+            _toast("当前订阅和分组筛选下没有可测速节点")
+            return
+        api = self._api
+        for n in names:
+            self._delay[n] = -2
+
+        def mark():
+            for n in names:
+                self._apply_delay(n)
+        run_on_ui_thread(mark)
+        res = self._delays(api, names)
+        for n in names:
+            d = res.get(n)
+            if isinstance(d, int) and d > 0:
+                self._delay.pop(n + "__error", None)
+            else:
+                self._delay[n + "__error"] = getattr(api, "last_delay_error", "内核未返回有效延迟")
+            self._delay[n] = d if isinstance(d, int) and d > 0 else 0
+        run_on_ui_thread(mark)
+
+    def _status(self):
+        k = self._kind()
+        path = _core_path(k)
+        size = os.path.getsize(path) / 1048576.0 if os.path.exists(path) else 0
+        err = ""
+        if _LIB_FUNCS is not None:
+            err = (_LIB_FUNCS[2]() or b"").decode("utf-8", "replace")
+        run = ("运行中 %s :%d" % (CORES[self._running_kind]["label"], self._port)) if self._started else "已停止"
+        _info("当前内核: %s（%s）| %s | 订阅 %d 个%s" % (
+            CORES[k]["label"], ("%.1f MB" % size) if size else "未安装", run,
+            len(self._load_sources()), (" | 错误: " + err) if err else ""))
